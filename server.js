@@ -22,9 +22,11 @@ const { Pool } = pkg;
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
-    rejectUnauthorized: false, // required for Supabase
+    rejectUnauthorized: false,
   },
+  family: 4, // 👈 FORCE IPv4 (THIS FIXES ENETUNREACH)
 });
+
 
 // Example: test connection
 pool.query('SELECT NOW()', (err, res) => {
@@ -268,3 +270,4 @@ app.get('/download/:jobId', async (req, res) => {
 
 // ------------------------
 app.listen(port,()=>console.log(`Server running at http://localhost:${port}`));
+
