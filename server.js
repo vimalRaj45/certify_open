@@ -287,11 +287,13 @@ app.post('/generate', async (req, res) => {
 // Background Processing Function
 // ------------------------
 // ------------------------
-// Enhanced Background Processing Function with Concurrent Generation
+// Enhanced Background Processing Function with Estimated Time
 // ------------------------
 async function processGenerationInBackground(jobId, userId, csvStoragePath, templateUrl, fields) {
   let participants = [];
-  let workerPool = null;
+  const startTime = Date.now();
+  let lastProgressTime = startTime;
+  let lastProcessedCount = 0;
   
   try {
     // Emit initial progress
@@ -303,6 +305,7 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       stage: 'initializing',
       processed: 0,
       total: 0,
+      estimatedTimeRemaining: null,
       timestamp: new Date().toISOString()
     });
 
@@ -328,6 +331,7 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       stage: 'downloading_csv',
       processed: 0,
       total: 0,
+      estimatedTimeRemaining: null,
       timestamp: new Date().toISOString()
     });
 
@@ -352,11 +356,13 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       return obj;
     });
 
+    const totalParticipants = participants.length;
+    
     // Update job with actual count
     await supabase
       .from('jobs')
       .update({
-        certificate_count: participants.length
+        certificate_count: totalParticipants
       })
       .eq('id', jobId);
 
@@ -368,7 +374,8 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       message: 'Downloading template...',
       stage: 'downloading_template',
       processed: 0,
-      total: participants.length,
+      total: totalParticipants,
+      estimatedTimeRemaining: null,
       timestamp: new Date().toISOString()
     });
 
@@ -391,24 +398,20 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       fontBytes = null;
     }
 
-    // 5. Generate certificates CONCURRENTLY with proper batching
+    // 5. Generate certificates CONCURRENTLY
     jobEvents.emit('progress', {
       jobId,
       type: 'progress',
       percent: 30,
-      message: `Generating ${participants.length} certificates concurrently...`,
+      message: `Generating ${totalParticipants} certificates...`,
       stage: 'generating',
       processed: 0,
-      total: participants.length,
+      total: totalParticipants,
+      estimatedTimeRemaining: null,
       timestamp: new Date().toISOString()
     });
 
     const pdfBuffers = [];
-    const totalParticipants = participants.length;
-    
-    // Calculate optimal concurrency (adjust based on your system)
-    const CONCURRENCY_LIMIT = 10; // Process 10 certificates at a time
-    const BATCH_SIZE = 10; // Show progress after each batch
     
     // Helper function to generate a single certificate
     async function generateCertificate(participant, index) {
@@ -464,7 +467,6 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
 
         const pdfBytes = await pdfDoc.save();
         
-        // Return result
         return {
           buffer: Buffer.from(pdfBytes),
           name: `${participant.name || participant[headers[0]] || `certificate_${index + 1}`}.pdf`,
@@ -472,7 +474,7 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
         };
       } catch (error) {
         console.error(`Error generating certificate ${index + 1}:`, error.message);
-        // Return a fallback certificate
+        // Return fallback
         const pdfDoc = await PDFDocument.create();
         const page = pdfDoc.addPage([600, 400]);
         page.drawText(`Certificate for ${participant.name || 'Participant'}`, {
@@ -491,7 +493,31 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       }
     }
 
-    // Process participants in parallel with concurrency control
+    // Function to calculate estimated time remaining
+    function calculateETA(processed, total, startTime) {
+      if (processed === 0) return null;
+      
+      const currentTime = Date.now();
+      const elapsedMs = currentTime - startTime;
+      const avgTimePerItem = elapsedMs / processed;
+      const remainingItems = total - processed;
+      const estimatedRemainingMs = avgTimePerItem * remainingItems;
+      
+      // Convert to human readable format
+      if (estimatedRemainingMs < 60000) {
+        return `${Math.ceil(estimatedRemainingMs / 1000)} seconds`;
+      } else if (estimatedRemainingMs < 3600000) {
+        return `${Math.ceil(estimatedRemainingMs / 60000)} minutes`;
+      } else {
+        const hours = Math.floor(estimatedRemainingMs / 3600000);
+        const minutes = Math.ceil((estimatedRemainingMs % 3600000) / 60000);
+        return `${hours}h ${minutes}m`;
+      }
+    }
+
+    // Process in parallel batches with concurrency control
+    const CONCURRENCY_LIMIT = 10;
+    
     for (let i = 0; i < totalParticipants; i += CONCURRENCY_LIMIT) {
       const batchStart = i;
       const batchEnd = Math.min(i + CONCURRENCY_LIMIT, totalParticipants);
@@ -509,31 +535,51 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       for (const result of batchResults) {
         pdfBuffers.push(result);
         
-        // Update progress after each certificate
         const currentProgress = pdfBuffers.length;
-        const percent = 30 + (currentProgress / totalParticipants * 60); // 30-90%
+        const percent = 30 + (currentProgress / totalParticipants * 60);
         
-        jobEvents.emit('progress', {
-          jobId,
-          type: 'progress',
-          percent: Math.round(percent),
-          message: `Generated ${currentProgress} of ${totalParticipants} certificates`,
-          stage: 'generating',
-          processed: currentProgress,
-          total: totalParticipants,
-          timestamp: new Date().toISOString()
-        });
+        // Calculate ETA every 10 certificates or every 30 seconds
+        const currentTime = Date.now();
+        if (currentProgress % 10 === 0 || currentTime - lastProgressTime > 30000) {
+          lastProgressTime = currentTime;
+          
+          const estimatedTimeRemaining = calculateETA(currentProgress, totalParticipants, startTime);
+          
+          jobEvents.emit('progress', {
+            jobId,
+            type: 'progress',
+            percent: Math.round(percent),
+            message: `Generated ${currentProgress} of ${totalParticipants} certificates`,
+            stage: 'generating',
+            processed: currentProgress,
+            total: totalParticipants,
+            estimatedTimeRemaining,
+            timestamp: new Date().toISOString()
+          });
+        }
       }
       
-      // Small delay to prevent overwhelming the system
+      // Small delay if needed
       if (i + CONCURRENCY_LIMIT < totalParticipants) {
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await new Promise(resolve => setTimeout(resolve, 50));
       }
-      
-      console.log(`✅ Processed batch ${Math.floor(i/CONCURRENCY_LIMIT) + 1}/${Math.ceil(totalParticipants/CONCURRENCY_LIMIT)}`);
     }
-    
-    // Sort by index to maintain order
+
+    // Ensure final progress update before archiving
+    const finalEstimatedTime = calculateETA(totalParticipants, totalParticipants, startTime);
+    jobEvents.emit('progress', {
+      jobId,
+      type: 'progress',
+      percent: 90,
+      message: `Generated all ${totalParticipants} certificates, creating ZIP...`,
+      stage: 'generating',
+      processed: totalParticipants,
+      total: totalParticipants,
+      estimatedTimeRemaining: finalEstimatedTime,
+      timestamp: new Date().toISOString()
+    });
+
+    // Sort by index
     pdfBuffers.sort((a, b) => a.index - b.index);
 
     // 6. Create ZIP with progress updates
@@ -545,6 +591,7 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       stage: 'archiving',
       processed: totalParticipants,
       total: totalParticipants,
+      estimatedTimeRemaining: 'Less than 1 minute',
       timestamp: new Date().toISOString()
     });
 
@@ -581,32 +628,50 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       .from('certificates')
       .getPublicUrl(zipFileName);
 
-    // 8. Update job status
+    // 8. Calculate total time taken
+    const totalTimeMs = Date.now() - startTime;
+    const totalTimeFormatted = totalTimeMs < 60000 
+      ? `${Math.round(totalTimeMs / 1000)} seconds`
+      : totalTimeMs < 3600000
+        ? `${Math.round(totalTimeMs / 60000)} minutes`
+        : `${Math.floor(totalTimeMs / 3600000)}h ${Math.round((totalTimeMs % 3600000) / 60000)}m`;
+
+    // Update job status
     await supabase
       .from('jobs')
       .update({
         status: 'completed',
         download_url: urlData.publicUrl,
+        final_zip_url: urlData.publicUrl, // ADD THIS LINE
+        generation_time_ms: totalTimeMs,
         updated_at: new Date().toISOString()
       })
       .eq('id', jobId);
 
-    // 9. Emit completion
+    // 9. Emit completion with timing info
     jobEvents.emit('progress', {
       jobId,
       type: 'completed',
       percent: 100,
-      message: `Generated ${totalParticipants} certificates successfully!`,
+      message: `Generated ${totalParticipants} certificates in ${totalTimeFormatted}!`,
       stage: 'completed',
       processed: totalParticipants,
       total: totalParticipants,
+      estimatedTimeRemaining: '0 seconds',
+      totalTimeTaken: totalTimeFormatted,
+      totalTimeMs: totalTimeMs,
       downloadUrl: urlData.publicUrl,
       timestamp: new Date().toISOString()
     });
 
-    console.log(`✅ Generated ${totalParticipants} certificates for job ${jobId} using concurrent processing`);
+    console.log(`✅ Generated ${totalParticipants} certificates in ${totalTimeFormatted} for job ${jobId}`);
 
   } catch (err) {
+    const errorTime = Date.now() - startTime;
+    const errorTimeFormatted = errorTime < 60000 
+      ? `${Math.round(errorTime / 1000)} seconds`
+      : `${Math.round(errorTime / 60000)} minutes`;
+    
     console.error('Generation error:', err);
     
     // Update job status to failed
@@ -615,196 +680,184 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       .update({
         status: 'failed',
         error_message: err.message,
+        final_zip_url: null, 
+        generation_time_ms: errorTime,
         updated_at: new Date().toISOString()
       })
       .eq('id', jobId);
 
-    // Emit error
+    // Emit error with timing info
     jobEvents.emit('progress', {
       jobId,
       type: 'error',
       percent: 0,
-      message: `Generation failed: ${err.message}`,
+      message: `Generation failed after ${errorTimeFormatted}: ${err.message}`,
       stage: 'failed',
       processed: 0,
       total: participants.length,
+      estimatedTimeRemaining: null,
       timestamp: new Date().toISOString()
     });
   }
 }
 
 // ------------------------
-// Alternative: Enhanced /generate-direct with concurrent processing
+// Enhanced /generate endpoint with initial time estimation
 // ------------------------
-app.post('/generate-direct-concurrent', upload.fields([
-  { name: 'template', maxCount: 1 },
-  { name: 'csv', maxCount: 1 }
-]), async (req, res) => {
-  const { userId, fields, concurrency = 5 } = req.body;
-  const templateFile = req.files?.template?.[0];
-  const csvFile = req.files?.csv?.[0];
+app.post('/generate-enhanced', async (req, res) => {
+  const { userId, csvStoragePath, templateUrl, fields } = req.body;
   
-  if (!userId || !csvFile || !templateFile) {
-    return res.status(400).json({ 
-      error: 'Missing required files. Need both template and CSV files.' 
-    });
+  if (!userId || !csvStoragePath) {
+    return res.status(400).json({ error: 'Missing required parameters' });
   }
 
+  // Create job ID early for SSE
+  const jobId = crypto.randomUUID();
+  
   try {
-    // Parse CSV
-    const csvContent = csvFile.buffer.toString('utf8');
+    // Get CSV row count first for better time estimation
+    const { data: csvData } = await supabase.storage
+      .from('certificates')
+      .download(csvStoragePath);
+    
+    const csvContent = await csvData.text();
     const lines = csvContent.split(/\r?\n/).filter(l => l.trim());
+    const rowCount = Math.max(0, lines.length - 1);
     
-    if (lines.length < 2) {
-      return res.status(400).json({ error: 'CSV must contain at least one data row' });
+    // Simple time estimation based on row count
+    let estimatedTotalTime = 'Calculating...';
+    if (rowCount > 0) {
+      const estimatedSeconds = Math.max(10, Math.round(rowCount * 0.3)); // ~0.3 seconds per certificate
+      if (estimatedSeconds < 60) {
+        estimatedTotalTime = `~${estimatedSeconds} seconds`;
+      } else {
+        estimatedTotalTime = `~${Math.round(estimatedSeconds / 60)} minutes`;
+      }
     }
     
-    const headers = lines[0].split(',').map(h => h.trim());
-    const participants = lines.slice(1).map(line => {
-      const values = line.split(',').map(v => v.trim());
-      const obj = {};
-      headers.forEach((h, i) => obj[h] = values[i] || '');
-      return obj;
+    // Send initial response with estimation
+    res.json({ 
+      jobId,
+      message: `Starting generation of ${rowCount} certificates. Estimated time: ${estimatedTotalTime}`,
+      progressUrl: `/progress/${jobId}`,
+      estimatedTotalTime,
+      certificateCount: rowCount
     });
+    
+    // Process in background
+    processGenerationInBackground(jobId, userId, csvStoragePath, templateUrl, fields);
+    
+  } catch (error) {
+    console.error('Initial estimation error:', error);
+    // Fallback to original behavior
+    res.json({ 
+      jobId,
+      message: 'Generation started. Connect to /progress/:jobId for updates.',
+      progressUrl: `/progress/${jobId}`
+    });
+    
+    processGenerationInBackground(jobId, userId, csvStoragePath, templateUrl, fields);
+  }
+});
 
-    // Create job record
-    const jobId = crypto.randomUUID();
-    await supabase
+// Update the database schema to store generation time
+// Add this to your Supabase migrations or run manually:
+/*
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS generation_time_ms INTEGER;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS estimated_time_seconds INTEGER;
+*/
+
+// ------------------------
+// Enhanced SSE Progress endpoint with time tracking
+// ------------------------
+app.get('/progress-enhanced/:jobId', async (req, res) => {
+  const jobId = req.params.jobId;
+  
+  // Set headers for SSE
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  
+  // Send initial connection with time
+  const startTime = Date.now();
+  res.write(`data: ${JSON.stringify({ 
+    type: 'connected', 
+    jobId,
+    startTime: new Date().toISOString(),
+    message: 'Connected to progress stream'
+  })}\n\n`);
+  
+  // Listen for progress updates
+  const progressHandler = (data) => {
+    if (data.jobId === jobId) {
+      // Add elapsed time to each update
+      const elapsedMs = Date.now() - startTime;
+      const elapsedFormatted = elapsedMs < 60000 
+        ? `${Math.round(elapsedMs / 1000)}s`
+        : `${Math.round(elapsedMs / 60000)}m`;
+      
+      data.elapsedTime = elapsedFormatted;
+      data.elapsedMs = elapsedMs;
+      
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+      
+      // Flush the response
+      if (typeof res.flush === 'function') {
+        res.flush();
+      }
+    }
+  };
+  
+  jobEvents.on('progress', progressHandler);
+  
+  // Handle client disconnect
+  req.on('close', () => {
+    jobEvents.off('progress', progressHandler);
+    const totalTime = Date.now() - startTime;
+    console.log(`SSE connection closed for job ${jobId} after ${totalTime}ms`);
+    res.end();
+  });
+});
+
+// ------------------------
+// Get job statistics endpoint
+// ------------------------
+app.get('/job-stats/:jobId', async (req, res) => {
+  const jobId = req.params.jobId;
+  
+  try {
+    const { data: jobData, error } = await supabase
       .from('jobs')
-      .insert([{
-        id: jobId,
-        user_id: userId,
-        status: 'processing',
-        certificate_count: participants.length,
-        created_at: new Date().toISOString()
-      }]);
+      .select('*')
+      .eq('id', jobId)
+      .single();
 
-    // Load font
-    const fontUrl = 'https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Mu4mxK.woff2';
-    let fontBytes;
-    try {
-      fontBytes = Buffer.from(await (await fetch(fontUrl)).arrayBuffer());
-    } catch (fontErr) {
-      console.warn('Using default font:', fontErr.message);
-      fontBytes = null;
+    if (error) {
+      return res.status(404).json({ error: 'Job not found' });
     }
 
-    // Set response headers
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', `attachment; filename="certificates_${Date.now()}.zip"`);
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('X-Job-ID', jobId);
+    // Calculate statistics
+    let stats = {
+      id: jobData.id,
+      status: jobData.status,
+      certificateCount: jobData.certificate_count,
+      createdAt: jobData.created_at,
+      generationTime: jobData.generation_time_ms ? 
+        (jobData.generation_time_ms < 60000 
+          ? `${Math.round(jobData.generation_time_ms / 1000)} seconds`
+          : `${Math.round(jobData.generation_time_ms / 60000)} minutes`) 
+        : null,
+      downloadUrl: jobData.download_url,
+      efficiency: jobData.generation_time_ms && jobData.certificate_count
+        ? `${(jobData.certificate_count / (jobData.generation_time_ms / 1000)).toFixed(2)} certificates/second`
+        : null
+    };
 
-    // Create ZIP archive
-    const archive = archiver('zip', { zlib: { level: 9 } });
-    archive.pipe(res);
-
-    // Store certificate buffers
-    const certificateBuffers = [];
-    const CONCURRENCY = parseInt(concurrency) || 5;
-    
-    // Process in concurrent batches
-    for (let i = 0; i < participants.length; i += CONCURRENCY) {
-      const batch = participants.slice(i, i + CONCURRENCY);
-      
-      const batchPromises = batch.map(async (participant, batchIndex) => {
-        const globalIndex = i + batchIndex;
-        
-        const pdfDoc = await PDFDocument.create();
-        
-        if (fontBytes) {
-          pdfDoc.registerFontkit(fontkit);
-          await pdfDoc.embedFont(fontBytes);
-        }
-        
-        const page = pdfDoc.addPage([600, 400]);
-
-        // Add template image
-        try {
-          let templateImage;
-          if (templateFile.mimetype === 'image/png') {
-            templateImage = await pdfDoc.embedPng(templateFile.buffer);
-          } else {
-            templateImage = await pdfDoc.embedJpg(templateFile.buffer);
-          }
-          page.drawImage(templateImage, { x: 0, y: 0, width: 600, height: 400 });
-        } catch (imgErr) {
-          console.warn('Failed to embed image:', imgErr.message);
-        }
-
-        // Add text fields
-        if (fields && Array.isArray(fields)) {
-          fields.forEach(f => {
-            const value = participant[f.field] || '';
-            if (value && f.x !== undefined && f.y !== undefined) {
-              try {
-                const hex = (f.color || '#000000').replace('#', '');
-                const r = parseInt(hex.slice(0, 2), 16) / 255;
-                const g = parseInt(hex.slice(2, 4), 16) / 255;
-                const b = parseInt(hex.slice(4, 6), 16) / 255;
-                
-                page.drawText(value.toString(), {
-                  x: f.x,
-                  y: 400 - f.y - (f.size || 16),
-                  size: f.size || 16,
-                  font: fontBytes ? undefined : pdfDoc.getFonts()[0],
-                  color: rgb(r, g, b)
-                });
-              } catch (fieldErr) {
-                console.warn(`Error drawing field ${f.field}:`, fieldErr.message);
-              }
-            }
-          });
-        }
-
-        const pdfBytes = await pdfDoc.save();
-        const participantName = participant.name || participant[headers[0]] || `certificate_${globalIndex + 1}`;
-        const safeFileName = `${participantName.replace(/[^a-zA-Z0-9]/g, '_')}.pdf`;
-        
-        return {
-          buffer: Buffer.from(pdfBytes),
-          name: safeFileName,
-          index: globalIndex
-        };
-      });
-
-      // Process batch concurrently
-      const batchResults = await Promise.all(batchPromises);
-      certificateBuffers.push(...batchResults);
-      
-      // Log progress
-      console.log(`Processed batch ${Math.floor(i/CONCURRENCY) + 1}/${Math.ceil(participants.length/CONCURRENCY)}`);
-    }
-
-    // Sort by index and add to archive
-    certificateBuffers
-      .sort((a, b) => a.index - b.index)
-      .forEach(cert => {
-        archive.append(cert.buffer, { name: cert.name });
-      });
-
-    await archive.finalize();
-    
-    // Update job status
-    await supabase
-      .from('jobs')
-      .update({
-        status: 'completed',
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', jobId);
-
-    console.log(`✅ Generated ${participants.length} certificates concurrently for user ${userId}`);
-
+    res.json(stats);
   } catch (err) {
-    console.error('Direct generation error:', err);
-    
-    if (!res.headersSent) {
-      res.status(500).json({ 
-        error: 'Generation failed',
-        details: process.env.NODE_ENV === 'development' ? err.message : undefined
-      });
-    }
+    console.error('Stats error:', err);
+    res.status(500).json({ error: 'Failed to get job statistics' });
   }
 });
 // ------------------------
