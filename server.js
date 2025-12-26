@@ -12,6 +12,7 @@ import { createClient } from '@supabase/supabase-js';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import crypto from 'crypto';
+import { EventEmitter } from 'events';
 
 dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
@@ -48,6 +49,11 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 const upload = multer({ storage: multer.memoryStorage() });
+
+// ------------------------
+// Event Emitter for Progress
+// ------------------------
+const jobEvents = new EventEmitter();
 
 // ------------------------
 // Helper Functions
@@ -216,13 +222,6 @@ app.post('/upload-csv', upload.single('csv'), async (req, res) => {
 });
 
 // ------------------------
-// Generate PDFs - Direct ZIP Download (No ZIP Storage)
-// ------------------------
-// Add near the top of server.js after imports
-import { EventEmitter } from 'events';
-const jobEvents = new EventEmitter();
-
-// ------------------------
 // SSE Progress Streaming Endpoint
 // ------------------------
 app.get('/progress/:jobId', async (req, res) => {
@@ -284,16 +283,12 @@ app.post('/generate', async (req, res) => {
 });
 
 // ------------------------
-// Background Processing Function
-// ------------------------
-// ------------------------
-// Enhanced Background Processing Function with Estimated Time
+// Optimized Background Processing Function
 // ------------------------
 async function processGenerationInBackground(jobId, userId, csvStoragePath, templateUrl, fields) {
   let participants = [];
   const startTime = Date.now();
   let lastProgressTime = startTime;
-  let lastProcessedCount = 0;
   
   try {
     // Emit initial progress
@@ -309,8 +304,8 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       timestamp: new Date().toISOString()
     });
 
-    // 1. Create job record
-    await supabase
+    // 1. Create job record with zip_url as null initially
+    const { error: insertError } = await supabase
       .from('jobs')
       .insert([{
         id: jobId,
@@ -319,8 +314,11 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
         csv_storage_path: csvStoragePath,
         status: 'processing',
         certificate_count: 0,
+        zip_url: null, // Initialize as null
         created_at: new Date().toISOString()
       }]);
+
+    if (insertError) throw new Error(`Failed to create job: ${insertError.message}`);
 
     // 2. Download CSV
     jobEvents.emit('progress', {
@@ -398,7 +396,7 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       fontBytes = null;
     }
 
-    // 5. Generate certificates CONCURRENTLY
+    // 5. Generate certificates CONCURRENTLY with optimized batch size
     jobEvents.emit('progress', {
       jobId,
       type: 'progress',
@@ -413,86 +411,6 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
 
     const pdfBuffers = [];
     
-    // Helper function to generate a single certificate
-    async function generateCertificate(participant, index) {
-      try {
-        const pdfDoc = await PDFDocument.create();
-        
-        if (fontBytes) {
-          pdfDoc.registerFontkit(fontkit);
-          await pdfDoc.embedFont(fontBytes);
-        }
-        
-        const page = pdfDoc.addPage([600, 400]);
-
-        // Add template image if available
-        if (templateBuffer) {
-          try {
-            let img;
-            if (templateUrl && templateUrl.endsWith('.png')) {
-              img = await pdfDoc.embedPng(templateBuffer);
-            } else {
-              img = await pdfDoc.embedJpg(templateBuffer);
-            }
-            page.drawImage(img, { x: 0, y: 0, width: 600, height: 400 });
-          } catch (imgErr) {
-            console.warn('Failed to embed image:', imgErr.message);
-          }
-        }
-
-        // Add text fields
-        if (fields && Array.isArray(fields)) {
-          fields.forEach(f => {
-            const value = participant[f.field] || '';
-            if (value && f.x !== undefined && f.y !== undefined) {
-              try {
-                const hex = (f.color || '#000000').replace('#', '');
-                const r = parseInt(hex.slice(0, 2), 16) / 255;
-                const g = parseInt(hex.slice(2, 4), 16) / 255;
-                const b = parseInt(hex.slice(4, 6), 16) / 255;
-                
-                page.drawText(value.toString(), {
-                  x: f.x,
-                  y: 400 - f.y - (f.size || 16),
-                  size: f.size || 16,
-                  font: fontBytes ? undefined : pdfDoc.getFonts()[0],
-                  color: rgb(r, g, b)
-                });
-              } catch (fieldErr) {
-                console.warn(`Error drawing field ${f.field}:`, fieldErr.message);
-              }
-            }
-          });
-        }
-
-        const pdfBytes = await pdfDoc.save();
-        
-        return {
-          buffer: Buffer.from(pdfBytes),
-          name: `${participant.name || participant[headers[0]] || `certificate_${index + 1}`}.pdf`,
-          index: index
-        };
-      } catch (error) {
-        console.error(`Error generating certificate ${index + 1}:`, error.message);
-        // Return fallback
-        const pdfDoc = await PDFDocument.create();
-        const page = pdfDoc.addPage([600, 400]);
-        page.drawText(`Certificate for ${participant.name || 'Participant'}`, {
-          x: 50,
-          y: 200,
-          size: 20
-        });
-        const pdfBytes = await pdfDoc.save();
-        
-        return {
-          buffer: Buffer.from(pdfBytes),
-          name: `certificate_${index + 1}_error.pdf`,
-          index: index,
-          error: error.message
-        };
-      }
-    }
-
     // Function to calculate estimated time remaining
     function calculateETA(processed, total, startTime) {
       if (processed === 0) return null;
@@ -524,10 +442,87 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       const currentBatch = participants.slice(batchStart, batchEnd);
       
       // Create promises for this batch
-      const batchPromises = currentBatch.map((participant, batchIndex) => 
-        generateCertificate(participant, batchStart + batchIndex)
-      );
-      
+      const batchPromises = currentBatch.map(async (participant, batchIndex) => {
+        const globalIndex = batchStart + batchIndex;
+        
+        try {
+          const pdfDoc = await PDFDocument.create();
+          
+          if (fontBytes) {
+            pdfDoc.registerFontkit(fontkit);
+            await pdfDoc.embedFont(fontBytes);
+          }
+          
+          const page = pdfDoc.addPage([600, 400]);
+
+          // Add template image if available
+          if (templateBuffer) {
+            try {
+              let img;
+              if (templateUrl && templateUrl.endsWith('.png')) {
+                img = await pdfDoc.embedPng(templateBuffer);
+              } else {
+                img = await pdfDoc.embedJpg(templateBuffer);
+              }
+              page.drawImage(img, { x: 0, y: 0, width: 600, height: 400 });
+            } catch (imgErr) {
+              console.warn('Failed to embed image:', imgErr.message);
+            }
+          }
+
+          // Add text fields
+          if (fields && Array.isArray(fields)) {
+            fields.forEach(f => {
+              const value = participant[f.field] || '';
+              if (value && f.x !== undefined && f.y !== undefined) {
+                try {
+                  const hex = (f.color || '#000000').replace('#', '');
+                  const r = parseInt(hex.slice(0, 2), 16) / 255;
+                  const g = parseInt(hex.slice(2, 4), 16) / 255;
+                  const b = parseInt(hex.slice(4, 6), 16) / 255;
+                  
+                  page.drawText(value.toString(), {
+                    x: f.x,
+                    y: 400 - f.y - (f.size || 16),
+                    size: f.size || 16,
+                    font: fontBytes ? undefined : pdfDoc.getFonts()[0],
+                    color: rgb(r, g, b)
+                  });
+                } catch (fieldErr) {
+                  console.warn(`Error drawing field ${f.field}:`, fieldErr.message);
+                }
+              }
+            });
+          }
+
+          const pdfBytes = await pdfDoc.save();
+          
+          return {
+            buffer: Buffer.from(pdfBytes),
+            name: `${participant.name || participant[headers[0]] || `certificate_${globalIndex + 1}`}.pdf`,
+            index: globalIndex
+          };
+        } catch (error) {
+          console.error(`Error generating certificate ${globalIndex + 1}:`, error.message);
+          // Return fallback certificate
+          const pdfDoc = await PDFDocument.create();
+          const page = pdfDoc.addPage([600, 400]);
+          page.drawText(`Certificate for ${participant.name || 'Participant'}`, {
+            x: 50,
+            y: 200,
+            size: 20
+          });
+          const pdfBytes = await pdfDoc.save();
+          
+          return {
+            buffer: Buffer.from(pdfBytes),
+            name: `certificate_${globalIndex + 1}_error.pdf`,
+            index: globalIndex,
+            error: error.message
+          };
+        }
+      });
+
       // Process batch concurrently
       const batchResults = await Promise.all(batchPromises);
       
@@ -559,45 +554,31 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
         }
       }
       
-      // Small delay if needed
+      // Small delay to prevent overwhelming the system
       if (i + CONCURRENCY_LIMIT < totalParticipants) {
-        await new Promise(resolve => setTimeout(resolve, 50));
+        await new Promise(resolve => setTimeout(resolve, 10));
       }
     }
-
-    // Ensure final progress update before archiving
-    const finalEstimatedTime = calculateETA(totalParticipants, totalParticipants, startTime);
-    jobEvents.emit('progress', {
-      jobId,
-      type: 'progress',
-      percent: 90,
-      message: `Generated all ${totalParticipants} certificates, creating ZIP...`,
-      stage: 'generating',
-      processed: totalParticipants,
-      total: totalParticipants,
-      estimatedTimeRemaining: finalEstimatedTime,
-      timestamp: new Date().toISOString()
-    });
 
     // Sort by index
     pdfBuffers.sort((a, b) => a.index - b.index);
 
-    // 6. Create ZIP with progress updates
+    // 6. Create ZIP with FASTER compression (level 1 instead of 9)
     jobEvents.emit('progress', {
       jobId,
       type: 'progress',
       percent: 90,
-      message: 'Creating ZIP archive...',
+      message: 'Creating ZIP archive (fast mode)...',
       stage: 'archiving',
       processed: totalParticipants,
       total: totalParticipants,
-      estimatedTimeRemaining: 'Less than 1 minute',
+      estimatedTimeRemaining: 'Less than 30 seconds',
       timestamp: new Date().toISOString()
     });
 
-    // Create ZIP in memory
+    // Create ZIP in memory with FAST compression
     const archive = archiver('zip', { 
-      zlib: { level: 9 }
+      zlib: { level: 1 } // CHANGED FROM 9 TO 1 FOR FASTER ARCHIVING
     });
     
     const zipBuffer = await new Promise((resolve, reject) => {
@@ -615,18 +596,23 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       archive.finalize();
     });
 
-    // 7. Store ZIP temporarily
+    // 7. Store ZIP and get URL
     const zipFileName = `zips/${jobId}.zip`;
-    await supabase.storage
+    const { error: uploadError } = await supabase.storage
       .from('certificates')
       .upload(zipFileName, zipBuffer, {
         contentType: 'application/zip',
         cacheControl: '3600',
+        upsert: true
       });
+
+    if (uploadError) throw new Error(`Failed to upload ZIP: ${uploadError.message}`);
 
     const { data: urlData } = supabase.storage
       .from('certificates')
       .getPublicUrl(zipFileName);
+
+    const zipUrl = urlData.publicUrl;
 
     // 8. Calculate total time taken
     const totalTimeMs = Date.now() - startTime;
@@ -636,19 +622,22 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
         ? `${Math.round(totalTimeMs / 60000)} minutes`
         : `${Math.floor(totalTimeMs / 3600000)}h ${Math.round((totalTimeMs % 3600000) / 60000)}m`;
 
-    // Update job status
-    await supabase
+    // 9. Update job status WITH ZIP URL STORED
+    const { error: updateError } = await supabase
       .from('jobs')
       .update({
         status: 'completed',
-        download_url: urlData.publicUrl,
-        final_zip_url: urlData.publicUrl, // ADD THIS LINE
+        download_url: zipUrl,
+        zip_url: zipUrl, // Store zip URL here
+        final_zip_url: zipUrl, // Also store in final_zip_url for compatibility
         generation_time_ms: totalTimeMs,
         updated_at: new Date().toISOString()
       })
       .eq('id', jobId);
 
-    // 9. Emit completion with timing info
+    if (updateError) throw new Error(`Failed to update job: ${updateError.message}`);
+
+    // 10. Emit completion with timing info
     jobEvents.emit('progress', {
       jobId,
       type: 'completed',
@@ -660,11 +649,12 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       estimatedTimeRemaining: '0 seconds',
       totalTimeTaken: totalTimeFormatted,
       totalTimeMs: totalTimeMs,
-      downloadUrl: urlData.publicUrl,
+      downloadUrl: zipUrl,
       timestamp: new Date().toISOString()
     });
 
     console.log(`✅ Generated ${totalParticipants} certificates in ${totalTimeFormatted} for job ${jobId}`);
+    console.log(`📦 ZIP URL stored in database: ${zipUrl}`);
 
   } catch (err) {
     const errorTime = Date.now() - startTime;
@@ -674,13 +664,14 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
     
     console.error('Generation error:', err);
     
-    // Update job status to failed
+    // Update job status to failed with null zip_url
     await supabase
       .from('jobs')
       .update({
         status: 'failed',
         error_message: err.message,
-        final_zip_url: null, 
+        zip_url: null,
+        final_zip_url: null,
         generation_time_ms: errorTime,
         updated_at: new Date().toISOString()
       })
@@ -701,165 +692,6 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
   }
 }
 
-// ------------------------
-// Enhanced /generate endpoint with initial time estimation
-// ------------------------
-app.post('/generate-enhanced', async (req, res) => {
-  const { userId, csvStoragePath, templateUrl, fields } = req.body;
-  
-  if (!userId || !csvStoragePath) {
-    return res.status(400).json({ error: 'Missing required parameters' });
-  }
-
-  // Create job ID early for SSE
-  const jobId = crypto.randomUUID();
-  
-  try {
-    // Get CSV row count first for better time estimation
-    const { data: csvData } = await supabase.storage
-      .from('certificates')
-      .download(csvStoragePath);
-    
-    const csvContent = await csvData.text();
-    const lines = csvContent.split(/\r?\n/).filter(l => l.trim());
-    const rowCount = Math.max(0, lines.length - 1);
-    
-    // Simple time estimation based on row count
-    let estimatedTotalTime = 'Calculating...';
-    if (rowCount > 0) {
-      const estimatedSeconds = Math.max(10, Math.round(rowCount * 0.3)); // ~0.3 seconds per certificate
-      if (estimatedSeconds < 60) {
-        estimatedTotalTime = `~${estimatedSeconds} seconds`;
-      } else {
-        estimatedTotalTime = `~${Math.round(estimatedSeconds / 60)} minutes`;
-      }
-    }
-    
-    // Send initial response with estimation
-    res.json({ 
-      jobId,
-      message: `Starting generation of ${rowCount} certificates. Estimated time: ${estimatedTotalTime}`,
-      progressUrl: `/progress/${jobId}`,
-      estimatedTotalTime,
-      certificateCount: rowCount
-    });
-    
-    // Process in background
-    processGenerationInBackground(jobId, userId, csvStoragePath, templateUrl, fields);
-    
-  } catch (error) {
-    console.error('Initial estimation error:', error);
-    // Fallback to original behavior
-    res.json({ 
-      jobId,
-      message: 'Generation started. Connect to /progress/:jobId for updates.',
-      progressUrl: `/progress/${jobId}`
-    });
-    
-    processGenerationInBackground(jobId, userId, csvStoragePath, templateUrl, fields);
-  }
-});
-
-// Update the database schema to store generation time
-// Add this to your Supabase migrations or run manually:
-/*
-ALTER TABLE jobs ADD COLUMN IF NOT EXISTS generation_time_ms INTEGER;
-ALTER TABLE jobs ADD COLUMN IF NOT EXISTS estimated_time_seconds INTEGER;
-*/
-
-// ------------------------
-// Enhanced SSE Progress endpoint with time tracking
-// ------------------------
-app.get('/progress-enhanced/:jobId', async (req, res) => {
-  const jobId = req.params.jobId;
-  
-  // Set headers for SSE
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  
-  // Send initial connection with time
-  const startTime = Date.now();
-  res.write(`data: ${JSON.stringify({ 
-    type: 'connected', 
-    jobId,
-    startTime: new Date().toISOString(),
-    message: 'Connected to progress stream'
-  })}\n\n`);
-  
-  // Listen for progress updates
-  const progressHandler = (data) => {
-    if (data.jobId === jobId) {
-      // Add elapsed time to each update
-      const elapsedMs = Date.now() - startTime;
-      const elapsedFormatted = elapsedMs < 60000 
-        ? `${Math.round(elapsedMs / 1000)}s`
-        : `${Math.round(elapsedMs / 60000)}m`;
-      
-      data.elapsedTime = elapsedFormatted;
-      data.elapsedMs = elapsedMs;
-      
-      res.write(`data: ${JSON.stringify(data)}\n\n`);
-      
-      // Flush the response
-      if (typeof res.flush === 'function') {
-        res.flush();
-      }
-    }
-  };
-  
-  jobEvents.on('progress', progressHandler);
-  
-  // Handle client disconnect
-  req.on('close', () => {
-    jobEvents.off('progress', progressHandler);
-    const totalTime = Date.now() - startTime;
-    console.log(`SSE connection closed for job ${jobId} after ${totalTime}ms`);
-    res.end();
-  });
-});
-
-// ------------------------
-// Get job statistics endpoint
-// ------------------------
-app.get('/job-stats/:jobId', async (req, res) => {
-  const jobId = req.params.jobId;
-  
-  try {
-    const { data: jobData, error } = await supabase
-      .from('jobs')
-      .select('*')
-      .eq('id', jobId)
-      .single();
-
-    if (error) {
-      return res.status(404).json({ error: 'Job not found' });
-    }
-
-    // Calculate statistics
-    let stats = {
-      id: jobData.id,
-      status: jobData.status,
-      certificateCount: jobData.certificate_count,
-      createdAt: jobData.created_at,
-      generationTime: jobData.generation_time_ms ? 
-        (jobData.generation_time_ms < 60000 
-          ? `${Math.round(jobData.generation_time_ms / 1000)} seconds`
-          : `${Math.round(jobData.generation_time_ms / 60000)} minutes`) 
-        : null,
-      downloadUrl: jobData.download_url,
-      efficiency: jobData.generation_time_ms && jobData.certificate_count
-        ? `${(jobData.certificate_count / (jobData.generation_time_ms / 1000)).toFixed(2)} certificates/second`
-        : null
-    };
-
-    res.json(stats);
-  } catch (err) {
-    console.error('Stats error:', err);
-    res.status(500).json({ error: 'Failed to get job statistics' });
-  }
-});
 // ------------------------
 // Alternative: Generate from direct file uploads (no storage)
 // ------------------------
@@ -903,6 +735,7 @@ app.post('/generate-direct', upload.fields([
         user_id: userId,
         status: 'processing',
         certificate_count: participants.length,
+        zip_url: null, // Will be null for direct generation
         created_at: new Date().toISOString()
       }]);
 
@@ -912,8 +745,8 @@ app.post('/generate-direct', upload.fields([
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('X-Job-ID', jobId);
 
-    // Create ZIP archive
-    const archive = archiver('zip', { zlib: { level: 9 } });
+    // Create ZIP archive with FAST compression
+    const archive = archiver('zip', { zlib: { level: 1 } }); // FAST compression
     archive.pipe(res);
 
     // Load font
@@ -926,66 +759,85 @@ app.post('/generate-direct', upload.fields([
       fontBytes = null;
     }
 
-    // Generate certificates
-    for (let i = 0; i < participants.length; i++) {
-      const participant = participants[i];
-      const pdfDoc = await PDFDocument.create();
+    // Generate certificates with batching for better performance
+    const BATCH_SIZE = 20;
+    
+    for (let i = 0; i < participants.length; i += BATCH_SIZE) {
+      const batch = participants.slice(i, i + BATCH_SIZE);
       
-      if (fontBytes) {
-        pdfDoc.registerFontkit(fontkit);
-        await pdfDoc.embedFont(fontBytes);
-      }
-      
-      const page = pdfDoc.addPage([600, 400]);
-
-      // Add template image
-      try {
-        let templateImage;
-        if (templateFile.mimetype === 'image/png') {
-          templateImage = await pdfDoc.embedPng(templateFile.buffer);
-        } else {
-          templateImage = await pdfDoc.embedJpg(templateFile.buffer);
+      const batchPromises = batch.map(async (participant, batchIndex) => {
+        const globalIndex = i + batchIndex;
+        
+        const pdfDoc = await PDFDocument.create();
+        
+        if (fontBytes) {
+          pdfDoc.registerFontkit(fontkit);
+          await pdfDoc.embedFont(fontBytes);
         }
-        page.drawImage(templateImage, { x: 0, y: 0, width: 600, height: 400 });
-      } catch (imgErr) {
-        console.warn('Failed to embed image:', imgErr.message);
-      }
+        
+        const page = pdfDoc.addPage([600, 400]);
 
-      // Add text fields
-      if (fields && Array.isArray(fields)) {
-        fields.forEach(f => {
-          const value = participant[f.field] || '';
-          if (value && f.x !== undefined && f.y !== undefined) {
-            try {
-              const hex = (f.color || '#000000').replace('#', '');
-              const r = parseInt(hex.slice(0, 2), 16) / 255;
-              const g = parseInt(hex.slice(2, 4), 16) / 255;
-              const b = parseInt(hex.slice(4, 6), 16) / 255;
-              
-              page.drawText(value.toString(), {
-                x: f.x,
-                y: 400 - f.y - (f.size || 16),
-                size: f.size || 16,
-                font: fontBytes ? undefined : pdfDoc.getFonts()[0],
-                color: rgb(r, g, b)
-              });
-            } catch (fieldErr) {
-              console.warn(`Error drawing field ${f.field}:`, fieldErr.message);
-            }
+        // Add template image
+        try {
+          let templateImage;
+          if (templateFile.mimetype === 'image/png') {
+            templateImage = await pdfDoc.embedPng(templateFile.buffer);
+          } else {
+            templateImage = await pdfDoc.embedJpg(templateFile.buffer);
           }
-        });
-      }
+          page.drawImage(templateImage, { x: 0, y: 0, width: 600, height: 400 });
+        } catch (imgErr) {
+          console.warn('Failed to embed image:', imgErr.message);
+        }
 
-      const pdfBytes = await pdfDoc.save();
-      const participantName = participant.name || participant[headers[0]] || `certificate_${i + 1}`;
-      const safeFileName = `${participantName.replace(/[^a-zA-Z0-9]/g, '_')}.pdf`;
+        // Add text fields
+        if (fields && Array.isArray(fields)) {
+          fields.forEach(f => {
+            const value = participant[f.field] || '';
+            if (value && f.x !== undefined && f.y !== undefined) {
+              try {
+                const hex = (f.color || '#000000').replace('#', '');
+                const r = parseInt(hex.slice(0, 2), 16) / 255;
+                const g = parseInt(hex.slice(2, 4), 16) / 255;
+                const b = parseInt(hex.slice(4, 6), 16) / 255;
+                
+                page.drawText(value.toString(), {
+                  x: f.x,
+                  y: 400 - f.y - (f.size || 16),
+                  size: f.size || 16,
+                  font: fontBytes ? undefined : pdfDoc.getFonts()[0],
+                  color: rgb(r, g, b)
+                });
+              } catch (fieldErr) {
+                console.warn(`Error drawing field ${f.field}:`, fieldErr.message);
+              }
+            }
+          });
+        }
+
+        const pdfBytes = await pdfDoc.save();
+        const participantName = participant.name || participant[headers[0]] || `certificate_${globalIndex + 1}`;
+        const safeFileName = `${participantName.replace(/[^a-zA-Z0-9]/g, '_')}.pdf`;
+        
+        return {
+          buffer: Buffer.from(pdfBytes),
+          name: safeFileName,
+          index: globalIndex
+        };
+      });
+
+      // Process batch concurrently
+      const batchResults = await Promise.all(batchPromises);
       
-      archive.append(Buffer.from(pdfBytes), { name: safeFileName });
+      // Add to archive
+      batchResults.forEach(cert => {
+        archive.append(cert.buffer, { name: cert.name });
+      });
     }
 
     await archive.finalize();
     
-    // Update job status
+    // Update job status (no zip_url for direct download)
     await supabase
       .from('jobs')
       .update({
@@ -1009,7 +861,7 @@ app.post('/generate-direct', upload.fields([
 });
 
 // ------------------------
-// Get user jobs (history)
+// Get user jobs with ZIP URLs
 // ------------------------
 app.get('/jobs/:userId', async (req, res) => {
   const userId = req.params.userId;
@@ -1017,7 +869,7 @@ app.get('/jobs/:userId', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('jobs')
-      .select('id, user_id, template_url, status, created_at, certificate_count, csv_storage_path')
+      .select('id, user_id, template_url, status, created_at, certificate_count, csv_storage_path, zip_url, download_url, final_zip_url')
       .eq('user_id', userId)
       .order('created_at', { ascending: false });
 
@@ -1026,10 +878,96 @@ app.get('/jobs/:userId', async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch jobs' });
     }
 
-    res.json(data || []);
+    // Map zip_url to each job for easy access
+    const jobsWithZipUrls = data.map(job => ({
+      ...job,
+      // Use zip_url if available, otherwise fallback to download_url or final_zip_url
+      zip_download_url: job.zip_url || job.download_url || job.final_zip_url
+    }));
+
+    res.json(jobsWithZipUrls || []);
   } catch (err) {
     console.error('Jobs endpoint error:', err);
     res.status(500).json({ error: 'Failed to fetch jobs' });
+  }
+});
+
+// ------------------------
+// Get job details including ZIP URL
+// ------------------------
+app.get('/job/:jobId', async (req, res) => {
+  const jobId = req.params.jobId;
+  const { userId } = req.query; // Optional user ID for validation
+  
+  try {
+    const { data: jobData, error } = await supabase
+      .from('jobs')
+      .select('*')
+      .eq('id', jobId)
+      .single();
+
+    if (error) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    // If userId provided, verify ownership
+    if (userId && jobData.user_id !== userId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    // Get the ZIP URL (prefer zip_url, then download_url, then final_zip_url)
+    const zipUrl = jobData.zip_url || jobData.download_url || jobData.final_zip_url;
+    
+    const response = {
+      ...jobData,
+      zip_download_url: zipUrl,
+      has_zip: !!zipUrl
+    };
+
+    res.json(response);
+  } catch (err) {
+    console.error('Job details error:', err);
+    res.status(500).json({ error: 'Failed to get job details' });
+  }
+});
+
+// ------------------------
+// Download ZIP by job ID
+// ------------------------
+app.get('/download/:jobId', async (req, res) => {
+  const jobId = req.params.jobId;
+  const { userId } = req.query;
+  
+  try {
+    // Get job details
+    const { data: jobData, error } = await supabase
+      .from('jobs')
+      .select('*')
+      .eq('id', jobId)
+      .single();
+
+    if (error) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    // Verify ownership if userId provided
+    if (userId && jobData.user_id !== userId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    // Get the ZIP URL
+    const zipUrl = jobData.zip_url || jobData.download_url || jobData.final_zip_url;
+    
+    if (!zipUrl) {
+      return res.status(404).json({ error: 'ZIP file not found for this job' });
+    }
+
+    // Redirect to the ZIP URL
+    res.redirect(zipUrl);
+    
+  } catch (err) {
+    console.error('Download error:', err);
+    res.status(500).json({ error: 'Failed to download ZIP' });
   }
 });
 
@@ -1118,7 +1056,7 @@ app.delete('/jobs/:jobId', async (req, res) => {
       return res.status(403).json({ error: error || 'Unauthorized' });
     }
 
-    // Delete from database only (no ZIP files to delete)
+    // Delete from database only (ZIP file remains in storage)
     const { error: deleteError } = await supabase
       .from('jobs')
       .delete()
@@ -1146,7 +1084,7 @@ app.get('/templates/:userId', async (req, res) => {
     // Get jobs that have templates
     const { data, error } = await supabase
       .from('jobs')
-      .select('id, template_url, csv_storage_path, created_at')
+      .select('id, template_url, csv_storage_path, created_at, zip_url')
       .eq('user_id', userId)
       .not('template_url', 'is', null)
       .order('created_at', { ascending: false });
@@ -1189,14 +1127,17 @@ app.get('/health', async (req, res) => {
 // ------------------------
 app.listen(port, () => {
   console.log(`✅ Server running at http://localhost:${port}`);
-  console.log(`☁️  Using Supabase for template/CSV storage only`);
-  console.log(`📦 ZIP files are NOT stored - sent directly to user`);
+  console.log(`☁️  Using Supabase for template/CSV storage`);
+  console.log(`📦 ZIP files ARE stored - URL saved in database`);
+  console.log(`⚡ Archiving optimized with FAST compression (level 1)`);
   console.log(`📊 Available endpoints:`);
   console.log(`   POST /upload-template (store template)`);
   console.log(`   POST /upload-csv (store CSV)`);
-  console.log(`   POST /generate (use stored files, direct ZIP download)`);
+  console.log(`   POST /generate (use stored files, store ZIP URL in DB)`);
   console.log(`   POST /generate-direct (direct upload, no storage)`);
-  console.log(`   GET  /jobs/:userId (job history)`);
+  console.log(`   GET  /jobs/:userId (job history with ZIP URLs)`);
+  console.log(`   GET  /job/:jobId (get job details with ZIP URL)`);
+  console.log(`   GET  /download/:jobId (download ZIP by job ID)`);
   console.log(`   GET  /templates/:userId (stored templates)`);
   console.log(`   DELETE /delete/template/:storagePath`);
   console.log(`   DELETE /delete/csv/:storagePath`);
