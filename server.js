@@ -218,6 +218,50 @@ app.post('/upload-csv', upload.single('csv'), async (req, res) => {
 // ------------------------
 // Generate PDFs - Direct ZIP Download (No ZIP Storage)
 // ------------------------
+// Add near the top of server.js after imports
+import { EventEmitter } from 'events';
+const jobEvents = new EventEmitter();
+
+// ------------------------
+// SSE Progress Streaming Endpoint
+// ------------------------
+app.get('/progress/:jobId', async (req, res) => {
+  const jobId = req.params.jobId;
+  
+  // Set headers for SSE
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  
+  // Send initial connection
+  res.write(`data: ${JSON.stringify({ type: 'connected', jobId })}\n\n`);
+  
+  // Listen for progress updates
+  const progressHandler = (data) => {
+    if (data.jobId === jobId) {
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+      
+      // Flush the response
+      if (typeof res.flush === 'function') {
+        res.flush();
+      }
+    }
+  };
+  
+  jobEvents.on('progress', progressHandler);
+  
+  // Handle client disconnect
+  req.on('close', () => {
+    jobEvents.off('progress', progressHandler);
+    console.log(`SSE connection closed for job ${jobId}`);
+    res.end();
+  });
+});
+
+// ------------------------
+// Generate PDFs with REAL-TIME PROGRESS
+// ------------------------
 app.post('/generate', async (req, res) => {
   const { userId, csvStoragePath, templateUrl, fields } = req.body;
   
@@ -225,8 +269,64 @@ app.post('/generate', async (req, res) => {
     return res.status(400).json({ error: 'Missing required parameters' });
   }
 
+  // Create job ID early for SSE
+  const jobId = crypto.randomUUID();
+  
+  // Send job ID immediately for frontend to connect
+  res.json({ 
+    jobId,
+    message: 'Generation started. Connect to /progress/:jobId for updates.',
+    progressUrl: `/progress/${jobId}`
+  });
+  
+  // Process in background
+  processGenerationInBackground(jobId, userId, csvStoragePath, templateUrl, fields);
+});
+
+// ------------------------
+// Background Processing Function
+// ------------------------
+async function processGenerationInBackground(jobId, userId, csvStoragePath, templateUrl, fields) {
+  let participants = [];
+  
   try {
-    // 1. Download CSV from Supabase Storage
+    // Emit initial progress
+    jobEvents.emit('progress', {
+      jobId,
+      type: 'started',
+      percent: 0,
+      message: 'Starting certificate generation...',
+      stage: 'initializing',
+      processed: 0,
+      total: 0,
+      timestamp: new Date().toISOString()
+    });
+
+    // 1. Create job record
+    await supabase
+      .from('jobs')
+      .insert([{
+        id: jobId,
+        user_id: userId,
+        template_url: templateUrl,
+        csv_storage_path: csvStoragePath,
+        status: 'processing',
+        certificate_count: 0,
+        created_at: new Date().toISOString()
+      }]);
+
+    // 2. Download CSV
+    jobEvents.emit('progress', {
+      jobId,
+      type: 'progress',
+      percent: 10,
+      message: 'Downloading CSV data...',
+      stage: 'downloading_csv',
+      processed: 0,
+      total: 0,
+      timestamp: new Date().toISOString()
+    });
+
     const { data: csvData, error: csvError } = await supabase.storage
       .from('certificates')
       .download(csvStoragePath);
@@ -237,72 +337,37 @@ app.post('/generate', async (req, res) => {
     const lines = csvContent.split(/\r?\n/).filter(l => l.trim());
     
     if (lines.length < 2) {
-      return res.status(400).json({ error: 'CSV must contain at least one data row' });
+      throw new Error('CSV must contain at least one data row');
     }
     
     const headers = lines[0].split(',').map(h => h.trim());
-    const participants = lines.slice(1).map(line => {
+    participants = lines.slice(1).map(line => {
       const values = line.split(',').map(v => v.trim());
       const obj = {};
       headers.forEach((h, i) => obj[h] = values[i] || '');
       return obj;
     });
 
-    // 2. Create job record in database (history only)
-    const jobId = crypto.randomUUID();
-    const { data: jobData, error: jobError } = await supabase
+    // Update job with actual count
+    await supabase
       .from('jobs')
-      .insert([{
-        id: jobId,
-        user_id: userId,
-        template_url: templateUrl,
-        csv_storage_path: csvStoragePath,
-        status: 'processing',
-        certificate_count: participants.length,
-        created_at: new Date().toISOString()
-      }])
-      .select()
-      .single();
+      .update({
+        certificate_count: participants.length
+      })
+      .eq('id', jobId);
 
-    if (jobError) {
-      console.warn('Failed to create job record:', jobError.message);
-    }
-
-    // 3. Set response headers for direct ZIP download
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', `attachment; filename="certificates_${Date.now()}.zip"`);
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('X-Job-ID', jobId);
-    res.setHeader('X-Certificate-Count', participants.length);
-
-    // 4. Create ZIP archive and pipe directly to response
-    const archive = archiver('zip', { 
-      zlib: { level: 9 },
-      comment: `Generated ${participants.length} certificates`
+    // 3. Download template
+    jobEvents.emit('progress', {
+      jobId,
+      type: 'progress',
+      percent: 20,
+      message: 'Downloading template...',
+      stage: 'downloading_template',
+      processed: 0,
+      total: participants.length,
+      timestamp: new Date().toISOString()
     });
-    
-    // Handle archive errors
-    archive.on('error', (err) => {
-      console.error('Archive error:', err);
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Archive creation failed' });
-      }
-    });
-    
-    // Pipe archive directly to response
-    archive.pipe(res);
 
-    // 5. Load font
-    const fontUrl = 'https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Mu4mxK.woff2';
-    let fontBytes;
-    try {
-      fontBytes = Buffer.from(await (await fetch(fontUrl)).arrayBuffer());
-    } catch (fontErr) {
-      console.warn('Using default font:', fontErr.message);
-      fontBytes = null;
-    }
-
-    // 6. Download template if URL provided
     let templateBuffer = null;
     if (templateUrl) {
       try {
@@ -312,14 +377,42 @@ app.post('/generate', async (req, res) => {
       }
     }
 
-    // 7. Generate certificates in batches
-    const BATCH_SIZE = 5;
-    let processedCount = 0;
+    // 4. Load font
+    const fontUrl = 'https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Mu4mxK.woff2';
+    let fontBytes;
+    try {
+      fontBytes = Buffer.from(await (await fetch(fontUrl)).arrayBuffer());
+    } catch (fontErr) {
+      console.warn('Using default font:', fontErr.message);
+      fontBytes = null;
+    }
+
+    // 5. Generate certificates with detailed progress
+    const BATCH_SIZE = 2; // Smaller batches for more frequent updates
+    const totalBatches = Math.ceil(participants.length / BATCH_SIZE);
     
-    for (let start = 0; start < participants.length; start += BATCH_SIZE) {
-      const batch = participants.slice(start, start + BATCH_SIZE);
+    jobEvents.emit('progress', {
+      jobId,
+      type: 'progress',
+      percent: 30,
+      message: `Generating ${participants.length} certificates...`,
+      stage: 'generating',
+      processed: 0,
+      total: participants.length,
+      timestamp: new Date().toISOString()
+    });
+
+    const pdfBuffers = [];
+    
+    for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+      const start = batchIndex * BATCH_SIZE;
+      const end = Math.min(start + BATCH_SIZE, participants.length);
+      const batch = participants.slice(start, end);
       
-      await Promise.all(batch.map(async (participant) => {
+      // Process batch
+      const batchPromises = batch.map(async (participant, indexInBatch) => {
+        const globalIndex = start + indexInBatch;
+        
         const pdfDoc = await PDFDocument.create();
         
         if (fontBytes) {
@@ -370,40 +463,127 @@ app.post('/generate', async (req, res) => {
         }
 
         const pdfBytes = await pdfDoc.save();
-        const participantName = participant.name || participant[headers[0]] || `certificate_${processedCount + 1}`;
-        const safeFileName = `${participantName.replace(/[^a-zA-Z0-9]/g, '_')}.pdf`;
-        
-        archive.append(Buffer.from(pdfBytes), { name: safeFileName });
-        processedCount++;
-      }));
+        pdfBuffers.push({
+          buffer: Buffer.from(pdfBytes),
+          name: `${participant.name || participant[headers[0]] || `certificate_${globalIndex + 1}`}.pdf`
+        });
+
+        // Emit progress for EACH certificate
+        const percent = 30 + (globalIndex / participants.length * 60); // 30-90%
+        jobEvents.emit('progress', {
+          jobId,
+          type: 'progress',
+          percent: Math.round(percent),
+          message: `Generated certificate ${globalIndex + 1} of ${participants.length}`,
+          stage: 'generating',
+          processed: globalIndex + 1,
+          total: participants.length,
+          timestamp: new Date().toISOString()
+        });
+      });
+
+      await Promise.all(batchPromises);
+      
+      // Small delay to show progress more smoothly
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
 
-    // 8. Finalize archive (this will trigger the response)
-    await archive.finalize();
+    // 6. Create ZIP with progress updates
+    jobEvents.emit('progress', {
+      jobId,
+      type: 'progress',
+      percent: 90,
+      message: 'Creating ZIP archive...',
+      stage: 'archiving',
+      processed: participants.length,
+      total: participants.length,
+      timestamp: new Date().toISOString()
+    });
+
+    // Create ZIP in memory
+    const archive = archiver('zip', { 
+      zlib: { level: 9 }
+    });
     
-    // 9. Update job status after successful generation
+    const zipBuffer = await new Promise((resolve, reject) => {
+      const chunks = [];
+      
+      archive.on('data', (chunk) => chunks.push(chunk));
+      archive.on('end', () => resolve(Buffer.concat(chunks)));
+      archive.on('error', reject);
+      
+      // Add all PDFs to archive
+      pdfBuffers.forEach(pdf => {
+        archive.append(pdf.buffer, { name: pdf.name });
+      });
+      
+      archive.finalize();
+    });
+
+    // 7. Store ZIP temporarily (or upload to storage)
+    const zipFileName = `zips/${jobId}.zip`;
+    await supabase.storage
+      .from('certificates')
+      .upload(zipFileName, zipBuffer, {
+        contentType: 'application/zip',
+        cacheControl: '3600',
+      });
+
+    const { data: urlData } = supabase.storage
+      .from('certificates')
+      .getPublicUrl(zipFileName);
+
+    // 8. Update job status
     await supabase
       .from('jobs')
       .update({
         status: 'completed',
+        download_url: urlData.publicUrl,
         updated_at: new Date().toISOString()
       })
       .eq('id', jobId);
 
+    // 9. Emit completion
+    jobEvents.emit('progress', {
+      jobId,
+      type: 'completed',
+      percent: 100,
+      message: `Generated ${participants.length} certificates successfully!`,
+      stage: 'completed',
+      processed: participants.length,
+      total: participants.length,
+      downloadUrl: urlData.publicUrl,
+      timestamp: new Date().toISOString()
+    });
+
     console.log(`✅ Generated ${participants.length} certificates for job ${jobId}`);
-    console.log(`📦 ZIP sent directly to user (not stored)`);
 
   } catch (err) {
     console.error('Generation error:', err);
     
-    if (!res.headersSent) {
-      res.status(500).json({ 
-        error: 'Generation failed',
-        details: process.env.NODE_ENV === 'development' ? err.message : undefined
-      });
-    }
+    // Update job status to failed
+    await supabase
+      .from('jobs')
+      .update({
+        status: 'failed',
+        error_message: err.message,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', jobId);
+
+    // Emit error
+    jobEvents.emit('progress', {
+      jobId,
+      type: 'error',
+      percent: 0,
+      message: `Generation failed: ${err.message}`,
+      stage: 'failed',
+      processed: 0,
+      total: participants.length,
+      timestamp: new Date().toISOString()
+    });
   }
-});
+}
 
 // ------------------------
 // Alternative: Generate from direct file uploads (no storage)
