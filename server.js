@@ -2,55 +2,44 @@ import express from 'express';
 import multer from 'multer';
 import archiver from 'archiver';
 import { PDFDocument, rgb } from 'pdf-lib';
-import { v2 as cloudinary } from 'cloudinary';
 import dotenv from 'dotenv';
 import fetch from 'node-fetch';
-import path from 'path';
 import fs from 'fs';
 import fontkit from '@pdf-lib/fontkit';
 import cors from 'cors';
 import bcrypt from 'bcrypt';
-import pkg from 'pg';
+import { createClient } from '@supabase/supabase-js';
 import { fileURLToPath } from 'url';
+import path from 'path';
+import crypto from 'crypto';
 
 dotenv.config();
-const { Pool } = pkg;
-
-// ------------------------
-// PostgreSQL
-// ------------------------
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false,
-  },
-  family: 4, // 👈 FORCE IPv4 (THIS FIXES ENETUNREACH)
-});
-
-
-// Example: test connection
-pool.query('SELECT NOW()', (err, res) => {
-  if (err) console.error('DB Connection Error:', err);
-  else console.log('DB Connected:', res.rows[0]);
-});
-// ------------------------
-// Cloudinary
-// ------------------------
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
-  secure: true,
-});
-
-// ------------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// ------------------------
+// Supabase Client Setup
+// ------------------------
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!supabaseUrl || !supabaseKey) {
+  console.error('❌ Missing Supabase credentials in .env file');
+  console.error('Add: SUPABASE_URL=your-project-url');
+  console.error('Add: SUPABASE_SERVICE_ROLE_KEY=your-service-role-key');
+  process.exit(1);
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+// ------------------------
+// Express App
+// ------------------------
 const app = express();
 const port = process.env.PORT || 5000;
 
 app.use(cors({
-  origin: 'http://localhost:3000',
+  origin: '*',
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
@@ -61,12 +50,7 @@ app.use(express.urlencoded({ extended: true }));
 const upload = multer({ storage: multer.memoryStorage() });
 
 // ------------------------
-// SSE clients storage
-// ------------------------
-let clients = [];
-
-// ------------------------
-// Helper: fetch image
+// Helper Functions
 // ------------------------
 async function getBufferFromUrl(url) {
   const res = await fetch(url);
@@ -74,200 +58,692 @@ async function getBufferFromUrl(url) {
   return Buffer.from(await res.arrayBuffer());
 }
 
-// ------------------------
-// Auth
-// ------------------------
-app.post('/signup', async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: 'Missing fields' });
-
-  const hashed = await bcrypt.hash(password, 10);
-
+// Helper to verify user ownership
+async function verifyUserOwnership(userId, jobId) {
   try {
-    const result = await pool.query(
-      'INSERT INTO users(email, password) VALUES($1, $2) RETURNING id,email',
-      [email, hashed]
-    );
-    res.json({ success: true, user: result.rows[0] });
+    const { data: jobData, error } = await supabase
+      .from('jobs')
+      .select('user_id')
+      .eq('id', jobId)
+      .single();
+
+    if (error) return { valid: false, error: 'Job not found' };
+    if (jobData.user_id !== userId) return { valid: false, error: 'Unauthorized' };
+    
+    return { valid: true, jobData };
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Signup failed' });
+    return { valid: false, error: err.message };
   }
-});
-
-app.post('/login', async (req,res)=>{
-  const { email, password } = req.body;
-  if(!email||!password) return res.status(400).json({error:'Missing fields'});
-  try{
-    const result = await pool.query('SELECT * FROM users WHERE email=$1',[email]);
-    const user = result.rows[0];
-    if(!user) return res.status(401).json({error:'Invalid credentials'});
-
-    const match = await bcrypt.compare(password,user.password);
-    if(!match) return res.status(401).json({error:'Invalid credentials'});
-
-    res.json({success:true,user:{id:user.id,email:user.email}});
-  }catch(err){
-    console.error(err);
-    res.status(500).json({error:'Login failed'});
-  }
-});
-
-// ------------------------
-// SSE Progress
-// ------------------------
-app.get('/progress/:jobId', (req,res)=>{
-  const jobId = req.params.jobId;
-  res.setHeader('Content-Type','text/event-stream');
-  res.setHeader('Cache-Control','no-cache');
-  res.setHeader('Connection','keep-alive');
-  res.flushHeaders();
-
-  const client = { id: Date.now()+Math.random(), jobId, res };
-  clients.push(client);
-
-  req.on('close', ()=>{
-    clients = clients.filter(c=>c.id!==client.id);
-  });
-});
-
-function sendProgress(jobId,data){
-  clients.forEach(c=>{
-    if(c.jobId===jobId){
-      c.res.write(`data: ${JSON.stringify(data)}\n\n`);
-    }
-  });
 }
 
 // ------------------------
-// Upload template
+// Auth Endpoints
 // ------------------------
-app.post('/upload-template', upload.single('template'), async (req,res)=>{
-  if(!req.file) return res.status(400).json({error:'No file'});
-  try{
-    const result = await new Promise((resolve,reject)=>{
-      const stream = cloudinary.uploader.upload_stream({resource_type:'image'}, (err,res)=>{
-        err?reject(err):resolve(res);
-      });
-      stream.end(req.file.buffer);
+app.post('/signup', async (req, res) => {
+  const { email, password } = req.body;
+  
+  try {
+    const userId = crypto.randomUUID();
+    
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .insert([{
+        id: userId,
+        email,
+        password_hash: await bcrypt.hash(password, 10)
+      }])
+      .select()
+      .single();
+
+    if (userError) {
+      if (userError.code === '23505') {
+        return res.status(400).json({ error: 'Email already exists' });
+      }
+      throw userError;
+    }
+
+    res.json({ 
+      success: true, 
+      user: { 
+        id: userId,
+        email 
+      } 
     });
-    res.json({templateUrl:result.secure_url});
-  }catch(err){
-    console.error(err);
-    res.status(500).json({error:'Upload failed'});
+  } catch (err) {
+    console.error('Signup error:', err);
+    res.status(500).json({ error: 'Signup failed: ' + err.message });
+  }
+});
+
+app.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+  
+  try {
+    const { data: userData, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email)
+      .single();
+
+    if (error || !userData) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const match = await bcrypt.compare(password, userData.password_hash);
+    if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+
+    res.json({ 
+      success: true, 
+      user: { 
+        id: userData.id,
+        email: userData.email 
+      } 
+    });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Login failed: ' + err.message });
   }
 });
 
 // ------------------------
-// Upload CSV
+// Upload Template to Supabase Storage
 // ------------------------
-app.post('/upload-csv', upload.single('csv'), async (req,res)=>{
-  if(!req.file) return res.status(400).json({error:'No CSV'});
-  const fileName = `temp/csv_${Date.now()}.csv`;
-  fs.writeFileSync(fileName, req.file.buffer);
-  res.json({csvPath:fileName});
+app.post('/upload-template', upload.single('template'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file' });
+
+  try {
+    const fileName = `templates/${Date.now()}_${req.file.originalname}`;
+    
+    const { data, error } = await supabase.storage
+      .from('certificates')
+      .upload(fileName, req.file.buffer, {
+        contentType: req.file.mimetype,
+        cacheControl: '3600',
+      });
+
+    if (error) throw error;
+
+    const { data: urlData } = supabase.storage
+      .from('certificates')
+      .getPublicUrl(fileName);
+
+    res.json({ 
+      templateUrl: urlData.publicUrl,
+      storagePath: fileName,
+      message: 'Template uploaded successfully'
+    });
+  } catch (err) {
+    console.error('Template upload error:', err);
+    res.status(500).json({ error: 'Upload failed: ' + err.message });
+  }
 });
 
 // ------------------------
-// Generate PDFs + ZIP
+// Upload CSV to Supabase Storage
 // ------------------------
-app.post('/generate', async (req,res)=>{
-  const { userId, csvPath, templateUrl, fields } = req.body;
-  if(!userId||!csvPath) return res.status(400).json({error:'Missing params'});
+app.post('/upload-csv', upload.single('csv'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No CSV' });
 
-  const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2,10)}`;
-  res.json({success:true, jobId});
+  try {
+    const fileName = `csv/${Date.now()}_${req.file.originalname}`;
+    
+    const { data, error } = await supabase.storage
+      .from('certificates')
+      .upload(fileName, req.file.buffer, {
+        contentType: 'text/csv',
+        cacheControl: '3600',
+      });
 
-  try{
-    const content = fs.readFileSync(csvPath,'utf8');
-    const lines = content.split(/\r?\n/).filter(l=>l.trim());
-    const headers = lines[0].split(',').map(h=>h.trim());
-    const participants = lines.slice(1).map(line=>{
-      const values = line.split(',').map(v=>v.trim());
-      const obj={};
-      headers.forEach((h,i)=>obj[h]=values[i]||'');
+    if (error) throw error;
+
+    const { data: urlData } = supabase.storage
+      .from('certificates')
+      .getPublicUrl(fileName);
+
+    const csvContent = req.file.buffer.toString('utf8');
+    
+    res.json({ 
+      csvStoragePath: fileName,
+      csvUrl: urlData.publicUrl,
+      csvContent: csvContent,
+      rowCount: csvContent.split('\n').length - 1,
+      message: 'CSV uploaded successfully'
+    });
+  } catch (err) {
+    console.error('CSV upload error:', err);
+    res.status(500).json({ error: 'Failed to upload CSV' });
+  }
+});
+
+// ------------------------
+// Generate PDFs - Direct ZIP Download (No ZIP Storage)
+// ------------------------
+app.post('/generate', async (req, res) => {
+  const { userId, csvStoragePath, templateUrl, fields } = req.body;
+  
+  if (!userId || !csvStoragePath) {
+    return res.status(400).json({ error: 'Missing required parameters' });
+  }
+
+  try {
+    // 1. Download CSV from Supabase Storage
+    const { data: csvData, error: csvError } = await supabase.storage
+      .from('certificates')
+      .download(csvStoragePath);
+
+    if (csvError) throw new Error(`Failed to download CSV: ${csvError.message}`);
+
+    const csvContent = await csvData.text();
+    const lines = csvContent.split(/\r?\n/).filter(l => l.trim());
+    
+    if (lines.length < 2) {
+      return res.status(400).json({ error: 'CSV must contain at least one data row' });
+    }
+    
+    const headers = lines[0].split(',').map(h => h.trim());
+    const participants = lines.slice(1).map(line => {
+      const values = line.split(',').map(v => v.trim());
+      const obj = {};
+      headers.forEach((h, i) => obj[h] = values[i] || '');
       return obj;
     });
 
-    const zipPath = path.join(__dirname,`temp/zip_${jobId}.zip`);
-    const output = fs.createWriteStream(zipPath);
-    const archive = archiver('zip',{zlib:{level:9}});
-    archive.pipe(output);
+    // 2. Create job record in database (history only)
+    const jobId = crypto.randomUUID();
+    const { data: jobData, error: jobError } = await supabase
+      .from('jobs')
+      .insert([{
+        id: jobId,
+        user_id: userId,
+        template_url: templateUrl,
+        csv_storage_path: csvStoragePath,
+        status: 'processing',
+        certificate_count: participants.length,
+        created_at: new Date().toISOString()
+      }])
+      .select()
+      .single();
 
-    const fontUrl = 'https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf';
-    const fontBytes = Buffer.from(await (await fetch(fontUrl)).arrayBuffer());
+    if (jobError) {
+      console.warn('Failed to create job record:', jobError.message);
+    }
 
+    // 3. Set response headers for direct ZIP download
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="certificates_${Date.now()}.zip"`);
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('X-Job-ID', jobId);
+    res.setHeader('X-Certificate-Count', participants.length);
+
+    // 4. Create ZIP archive and pipe directly to response
+    const archive = archiver('zip', { 
+      zlib: { level: 9 },
+      comment: `Generated ${participants.length} certificates`
+    });
+    
+    // Handle archive errors
+    archive.on('error', (err) => {
+      console.error('Archive error:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Archive creation failed' });
+      }
+    });
+    
+    // Pipe archive directly to response
+    archive.pipe(res);
+
+    // 5. Load font
+    const fontUrl = 'https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Mu4mxK.woff2';
+    let fontBytes;
+    try {
+      fontBytes = Buffer.from(await (await fetch(fontUrl)).arrayBuffer());
+    } catch (fontErr) {
+      console.warn('Using default font:', fontErr.message);
+      fontBytes = null;
+    }
+
+    // 6. Download template if URL provided
+    let templateBuffer = null;
+    if (templateUrl) {
+      try {
+        templateBuffer = await getBufferFromUrl(templateUrl);
+      } catch (templateErr) {
+        console.warn('Failed to download template:', templateErr.message);
+      }
+    }
+
+    // 7. Generate certificates in batches
     const BATCH_SIZE = 5;
-    let processed = 0;
-
-    for(let start=0;start<participants.length;start+=BATCH_SIZE){
-      const batch = participants.slice(start,start+BATCH_SIZE);
-      await Promise.all(batch.map(async p=>{
+    let processedCount = 0;
+    
+    for (let start = 0; start < participants.length; start += BATCH_SIZE) {
+      const batch = participants.slice(start, start + BATCH_SIZE);
+      
+      await Promise.all(batch.map(async (participant) => {
         const pdfDoc = await PDFDocument.create();
-        pdfDoc.registerFontkit(fontkit);
-        const font = await pdfDoc.embedFont(fontBytes);
-        const page = pdfDoc.addPage([600,400]);
+        
+        if (fontBytes) {
+          pdfDoc.registerFontkit(fontkit);
+          await pdfDoc.embedFont(fontBytes);
+        }
+        
+        const page = pdfDoc.addPage([600, 400]);
 
-        if(templateUrl){
-          const imgBytes = await getBufferFromUrl(templateUrl);
-          let img;
-          if(templateUrl.endsWith('.png')) img = await pdfDoc.embedPng(imgBytes);
-          else img = await pdfDoc.embedJpg(imgBytes);
-          page.drawImage(img,{x:0,y:0,width:600,height:400});
+        // Add template image if available
+        if (templateBuffer) {
+          try {
+            let img;
+            if (templateUrl && templateUrl.endsWith('.png')) {
+              img = await pdfDoc.embedPng(templateBuffer);
+            } else {
+              img = await pdfDoc.embedJpg(templateBuffer);
+            }
+            page.drawImage(img, { x: 0, y: 0, width: 600, height: 400 });
+          } catch (imgErr) {
+            console.warn('Failed to embed image:', imgErr.message);
+          }
         }
 
-        fields?.forEach(f=>{
-          const value = p[f.field]||'';
-          const hex = (f.color||'#000000').replace('#','');
-          page.drawText(value.toString(),{
-            x:f.x,
-            y:400-f.y-f.size,
-            size:f.size,
-            font,
-            color: rgb(parseInt(hex.slice(0,2),16)/255, parseInt(hex.slice(2,4),16)/255, parseInt(hex.slice(4,6),16)/255)
+        // Add text fields
+        if (fields && Array.isArray(fields)) {
+          fields.forEach(f => {
+            const value = participant[f.field] || '';
+            if (value && f.x !== undefined && f.y !== undefined) {
+              try {
+                const hex = (f.color || '#000000').replace('#', '');
+                const r = parseInt(hex.slice(0, 2), 16) / 255;
+                const g = parseInt(hex.slice(2, 4), 16) / 255;
+                const b = parseInt(hex.slice(4, 6), 16) / 255;
+                
+                page.drawText(value.toString(), {
+                  x: f.x,
+                  y: 400 - f.y - (f.size || 16),
+                  size: f.size || 16,
+                  font: fontBytes ? undefined : pdfDoc.getFonts()[0],
+                  color: rgb(r, g, b)
+                });
+              } catch (fieldErr) {
+                console.warn(`Error drawing field ${f.field}:`, fieldErr.message);
+              }
+            }
           });
-        });
+        }
 
         const pdfBytes = await pdfDoc.save();
-        archive.append(Buffer.from(pdfBytes),{name:`${p.name||'user'}.pdf`});
-
-        processed++;
-        sendProgress(jobId,{processed,total:participants.length,percent:Math.round((processed/participants.length)*100)});
+        const participantName = participant.name || participant[headers[0]] || `certificate_${processedCount + 1}`;
+        const safeFileName = `${participantName.replace(/[^a-zA-Z0-9]/g, '_')}.pdf`;
+        
+        archive.append(Buffer.from(pdfBytes), { name: safeFileName });
+        processedCount++;
       }));
     }
 
+    // 8. Finalize archive (this will trigger the response)
     await archive.finalize();
-    await pool.query(
-      'INSERT INTO jobs(user_id,template_url,csv_path,zip_path,status) VALUES($1,$2,$3,$4,$5)',
-      [userId, templateUrl, csvPath, zipPath, 'completed']
-    );
+    
+    // 9. Update job status after successful generation
+    await supabase
+      .from('jobs')
+      .update({
+        status: 'completed',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', jobId);
 
-    output.on('close',()=>sendProgress(jobId,{completed:true,downloadUrl:`/download/${jobId}`}));
+    console.log(`✅ Generated ${participants.length} certificates for job ${jobId}`);
+    console.log(`📦 ZIP sent directly to user (not stored)`);
 
-  }catch(err){
-    console.error(err);
-    sendProgress(jobId,{error:'Generation failed'});
+  } catch (err) {
+    console.error('Generation error:', err);
+    
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        error: 'Generation failed',
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    }
   }
 });
 
 // ------------------------
-// Download ZIP
+// Alternative: Generate from direct file uploads (no storage)
 // ------------------------
-// Add this for download endpoint
-app.get('/download/:jobId', async (req, res) => {
-  const jobId = req.params.jobId;
-  const result = await pool.query('SELECT * FROM jobs WHERE zip_path LIKE $1',['%'+jobId+'%']);
-  const job = result.rows[0];
-  if(!job || !fs.existsSync(job.zip_path)) return res.status(404).send('ZIP not found');
+app.post('/generate-direct', upload.fields([
+  { name: 'template', maxCount: 1 },
+  { name: 'csv', maxCount: 1 }
+]), async (req, res) => {
+  const { userId, fields } = req.body;
+  const templateFile = req.files?.template?.[0];
+  const csvFile = req.files?.csv?.[0];
   
-  // Set proper headers for download
-  res.setHeader('Content-Type', 'application/zip');
-  res.setHeader('Content-Disposition', `attachment; filename="certificates_${jobId}.zip"`);
-  res.download(job.zip_path, `certificates_${jobId}.zip`, (err)=>{
-    if(err) console.error('Download error:', err);
-  });
+  if (!userId || !csvFile || !templateFile) {
+    return res.status(400).json({ 
+      error: 'Missing required files. Need both template and CSV files.' 
+    });
+  }
+
+  try {
+    // Parse CSV
+    const csvContent = csvFile.buffer.toString('utf8');
+    const lines = csvContent.split(/\r?\n/).filter(l => l.trim());
+    
+    if (lines.length < 2) {
+      return res.status(400).json({ error: 'CSV must contain at least one data row' });
+    }
+    
+    const headers = lines[0].split(',').map(h => h.trim());
+    const participants = lines.slice(1).map(line => {
+      const values = line.split(',').map(v => v.trim());
+      const obj = {};
+      headers.forEach((h, i) => obj[h] = values[i] || '');
+      return obj;
+    });
+
+    // Create job record
+    const jobId = crypto.randomUUID();
+    await supabase
+      .from('jobs')
+      .insert([{
+        id: jobId,
+        user_id: userId,
+        status: 'processing',
+        certificate_count: participants.length,
+        created_at: new Date().toISOString()
+      }]);
+
+    // Set response headers
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="certificates_${Date.now()}.zip"`);
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('X-Job-ID', jobId);
+
+    // Create ZIP archive
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    archive.pipe(res);
+
+    // Load font
+    const fontUrl = 'https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Mu4mxK.woff2';
+    let fontBytes;
+    try {
+      fontBytes = Buffer.from(await (await fetch(fontUrl)).arrayBuffer());
+    } catch (fontErr) {
+      console.warn('Using default font:', fontErr.message);
+      fontBytes = null;
+    }
+
+    // Generate certificates
+    for (let i = 0; i < participants.length; i++) {
+      const participant = participants[i];
+      const pdfDoc = await PDFDocument.create();
+      
+      if (fontBytes) {
+        pdfDoc.registerFontkit(fontkit);
+        await pdfDoc.embedFont(fontBytes);
+      }
+      
+      const page = pdfDoc.addPage([600, 400]);
+
+      // Add template image
+      try {
+        let templateImage;
+        if (templateFile.mimetype === 'image/png') {
+          templateImage = await pdfDoc.embedPng(templateFile.buffer);
+        } else {
+          templateImage = await pdfDoc.embedJpg(templateFile.buffer);
+        }
+        page.drawImage(templateImage, { x: 0, y: 0, width: 600, height: 400 });
+      } catch (imgErr) {
+        console.warn('Failed to embed image:', imgErr.message);
+      }
+
+      // Add text fields
+      if (fields && Array.isArray(fields)) {
+        fields.forEach(f => {
+          const value = participant[f.field] || '';
+          if (value && f.x !== undefined && f.y !== undefined) {
+            try {
+              const hex = (f.color || '#000000').replace('#', '');
+              const r = parseInt(hex.slice(0, 2), 16) / 255;
+              const g = parseInt(hex.slice(2, 4), 16) / 255;
+              const b = parseInt(hex.slice(4, 6), 16) / 255;
+              
+              page.drawText(value.toString(), {
+                x: f.x,
+                y: 400 - f.y - (f.size || 16),
+                size: f.size || 16,
+                font: fontBytes ? undefined : pdfDoc.getFonts()[0],
+                color: rgb(r, g, b)
+              });
+            } catch (fieldErr) {
+              console.warn(`Error drawing field ${f.field}:`, fieldErr.message);
+            }
+          }
+        });
+      }
+
+      const pdfBytes = await pdfDoc.save();
+      const participantName = participant.name || participant[headers[0]] || `certificate_${i + 1}`;
+      const safeFileName = `${participantName.replace(/[^a-zA-Z0-9]/g, '_')}.pdf`;
+      
+      archive.append(Buffer.from(pdfBytes), { name: safeFileName });
+    }
+
+    await archive.finalize();
+    
+    // Update job status
+    await supabase
+      .from('jobs')
+      .update({
+        status: 'completed',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', jobId);
+
+    console.log(`✅ Generated ${participants.length} certificates directly for user ${userId}`);
+
+  } catch (err) {
+    console.error('Direct generation error:', err);
+    
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        error: 'Generation failed',
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    }
+  }
 });
 
 // ------------------------
-app.listen(port,()=>console.log(`Server running at http://localhost:${port}`));
+// Get user jobs (history)
+// ------------------------
+app.get('/jobs/:userId', async (req, res) => {
+  const userId = req.params.userId;
+  
+  try {
+    const { data, error } = await supabase
+      .from('jobs')
+      .select('id, user_id, template_url, status, created_at, certificate_count, csv_storage_path')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
 
+    if (error) {
+      console.error('Jobs fetch error:', error);
+      return res.status(500).json({ error: 'Failed to fetch jobs' });
+    }
+
+    res.json(data || []);
+  } catch (err) {
+    console.error('Jobs endpoint error:', err);
+    res.status(500).json({ error: 'Failed to fetch jobs' });
+  }
+});
+
+// ------------------------
+// Delete template from storage
+// ------------------------
+app.delete('/delete/template/:storagePath', async (req, res) => {
+  const storagePath = req.params.storagePath;
+  const { userId } = req.body;
+
+  if (!userId) {
+    return res.status(400).json({ error: 'User ID required' });
+  }
+
+  try {
+    // Delete from Supabase Storage
+    const { data: deleteData, error: deleteError } = await supabase.storage
+      .from('certificates')
+      .remove([storagePath]);
+
+    if (deleteError) {
+      console.error('Storage delete error:', deleteError);
+      return res.status(500).json({ error: 'Failed to delete template from storage' });
+    }
+
+    res.json({ 
+      success: true, 
+      message: 'Template deleted successfully',
+      deletedPath: storagePath
+    });
+
+  } catch (err) {
+    console.error('Delete template error:', err);
+    res.status(500).json({ error: 'Failed to delete template' });
+  }
+});
+
+// ------------------------
+// Delete CSV from storage
+// ------------------------
+app.delete('/delete/csv/:storagePath', async (req, res) => {
+  const storagePath = req.params.storagePath;
+  const { userId } = req.body;
+
+  if (!userId) {
+    return res.status(400).json({ error: 'User ID required' });
+  }
+
+  try {
+    const { data: deleteData, error: deleteError } = await supabase.storage
+      .from('certificates')
+      .remove([storagePath]);
+
+    if (deleteError) {
+      console.error('Storage delete error:', deleteError);
+      return res.status(500).json({ error: 'Failed to delete CSV from storage' });
+    }
+
+    res.json({ 
+      success: true, 
+      message: 'CSV deleted successfully',
+      deletedPath: storagePath
+    });
+
+  } catch (err) {
+    console.error('Delete CSV error:', err);
+    res.status(500).json({ error: 'Failed to delete CSV' });
+  }
+});
+
+// ------------------------
+// Delete job history
+// ------------------------
+app.delete('/jobs/:jobId', async (req, res) => {
+  const jobId = req.params.jobId;
+  const { userId } = req.body;
+
+  if (!userId) {
+    return res.status(400).json({ error: 'User ID required' });
+  }
+
+  try {
+    // Verify user ownership
+    const { valid, error } = await verifyUserOwnership(userId, jobId);
+    if (!valid) {
+      return res.status(403).json({ error: error || 'Unauthorized' });
+    }
+
+    // Delete from database only (no ZIP files to delete)
+    const { error: deleteError } = await supabase
+      .from('jobs')
+      .delete()
+      .eq('id', jobId);
+
+    if (deleteError) throw deleteError;
+
+    res.json({ 
+      success: true, 
+      message: 'Job history deleted'
+    });
+  } catch (err) {
+    console.error('Delete error:', err);
+    res.status(500).json({ error: 'Failed to delete job' });
+  }
+});
+
+// ------------------------
+// Get user's stored templates
+// ------------------------
+app.get('/templates/:userId', async (req, res) => {
+  const userId = req.params.userId;
+  
+  try {
+    // Get jobs that have templates
+    const { data, error } = await supabase
+      .from('jobs')
+      .select('id, template_url, csv_storage_path, created_at')
+      .eq('user_id', userId)
+      .not('template_url', 'is', null)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('Templates fetch error:', error);
+      return res.status(500).json({ error: 'Failed to fetch templates' });
+    }
+
+    res.json(data || []);
+  } catch (err) {
+    console.error('Templates endpoint error:', err);
+    res.status(500).json({ error: 'Failed to fetch templates' });
+  }
+});
+
+// ------------------------
+// Health check
+// ------------------------
+app.get('/health', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('users').select('count').limit(1);
+    
+    res.json({ 
+      status: 'healthy',
+      supabase: error ? 'disconnected' : 'connected',
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    res.status(503).json({ 
+      status: 'unhealthy',
+      supabase: 'disconnected',
+      error: err.message
+    });
+  }
+});
+
+// ------------------------
+// Start server
+// ------------------------
+app.listen(port, () => {
+  console.log(`✅ Server running at http://localhost:${port}`);
+  console.log(`☁️  Using Supabase for template/CSV storage only`);
+  console.log(`📦 ZIP files are NOT stored - sent directly to user`);
+  console.log(`📊 Available endpoints:`);
+  console.log(`   POST /upload-template (store template)`);
+  console.log(`   POST /upload-csv (store CSV)`);
+  console.log(`   POST /generate (use stored files, direct ZIP download)`);
+  console.log(`   POST /generate-direct (direct upload, no storage)`);
+  console.log(`   GET  /jobs/:userId (job history)`);
+  console.log(`   GET  /templates/:userId (stored templates)`);
+  console.log(`   DELETE /delete/template/:storagePath`);
+  console.log(`   DELETE /delete/csv/:storagePath`);
+  console.log(`   DELETE /jobs/:jobId (delete history)`);
+});
