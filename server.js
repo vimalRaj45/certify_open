@@ -286,8 +286,12 @@ app.post('/generate', async (req, res) => {
 // ------------------------
 // Background Processing Function
 // ------------------------
+// ------------------------
+// Enhanced Background Processing Function with Concurrent Generation
+// ------------------------
 async function processGenerationInBackground(jobId, userId, csvStoragePath, templateUrl, fields) {
   let participants = [];
+  let workerPool = null;
   
   try {
     // Emit initial progress
@@ -387,15 +391,12 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       fontBytes = null;
     }
 
-    // 5. Generate certificates with detailed progress
-    const BATCH_SIZE = 2; // Smaller batches for more frequent updates
-    const totalBatches = Math.ceil(participants.length / BATCH_SIZE);
-    
+    // 5. Generate certificates CONCURRENTLY with proper batching
     jobEvents.emit('progress', {
       jobId,
       type: 'progress',
       percent: 30,
-      message: `Generating ${participants.length} certificates...`,
+      message: `Generating ${participants.length} certificates concurrently...`,
       stage: 'generating',
       processed: 0,
       total: participants.length,
@@ -403,16 +404,15 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
     });
 
     const pdfBuffers = [];
+    const totalParticipants = participants.length;
     
-    for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
-      const start = batchIndex * BATCH_SIZE;
-      const end = Math.min(start + BATCH_SIZE, participants.length);
-      const batch = participants.slice(start, end);
-      
-      // Process batch
-      const batchPromises = batch.map(async (participant, indexInBatch) => {
-        const globalIndex = start + indexInBatch;
-        
+    // Calculate optimal concurrency (adjust based on your system)
+    const CONCURRENCY_LIMIT = 10; // Process 10 certificates at a time
+    const BATCH_SIZE = 10; // Show progress after each batch
+    
+    // Helper function to generate a single certificate
+    async function generateCertificate(participant, index) {
+      try {
         const pdfDoc = await PDFDocument.create();
         
         if (fontBytes) {
@@ -463,30 +463,78 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
         }
 
         const pdfBytes = await pdfDoc.save();
-        pdfBuffers.push({
+        
+        // Return result
+        return {
           buffer: Buffer.from(pdfBytes),
-          name: `${participant.name || participant[headers[0]] || `certificate_${globalIndex + 1}`}.pdf`
+          name: `${participant.name || participant[headers[0]] || `certificate_${index + 1}`}.pdf`,
+          index: index
+        };
+      } catch (error) {
+        console.error(`Error generating certificate ${index + 1}:`, error.message);
+        // Return a fallback certificate
+        const pdfDoc = await PDFDocument.create();
+        const page = pdfDoc.addPage([600, 400]);
+        page.drawText(`Certificate for ${participant.name || 'Participant'}`, {
+          x: 50,
+          y: 200,
+          size: 20
         });
+        const pdfBytes = await pdfDoc.save();
+        
+        return {
+          buffer: Buffer.from(pdfBytes),
+          name: `certificate_${index + 1}_error.pdf`,
+          index: index,
+          error: error.message
+        };
+      }
+    }
 
-        // Emit progress for EACH certificate
-        const percent = 30 + (globalIndex / participants.length * 60); // 30-90%
+    // Process participants in parallel with concurrency control
+    for (let i = 0; i < totalParticipants; i += CONCURRENCY_LIMIT) {
+      const batchStart = i;
+      const batchEnd = Math.min(i + CONCURRENCY_LIMIT, totalParticipants);
+      const currentBatch = participants.slice(batchStart, batchEnd);
+      
+      // Create promises for this batch
+      const batchPromises = currentBatch.map((participant, batchIndex) => 
+        generateCertificate(participant, batchStart + batchIndex)
+      );
+      
+      // Process batch concurrently
+      const batchResults = await Promise.all(batchPromises);
+      
+      // Add results to main array
+      for (const result of batchResults) {
+        pdfBuffers.push(result);
+        
+        // Update progress after each certificate
+        const currentProgress = pdfBuffers.length;
+        const percent = 30 + (currentProgress / totalParticipants * 60); // 30-90%
+        
         jobEvents.emit('progress', {
           jobId,
           type: 'progress',
           percent: Math.round(percent),
-          message: `Generated certificate ${globalIndex + 1} of ${participants.length}`,
+          message: `Generated ${currentProgress} of ${totalParticipants} certificates`,
           stage: 'generating',
-          processed: globalIndex + 1,
-          total: participants.length,
+          processed: currentProgress,
+          total: totalParticipants,
           timestamp: new Date().toISOString()
         });
-      });
-
-      await Promise.all(batchPromises);
+      }
       
-      // Small delay to show progress more smoothly
-      await new Promise(resolve => setTimeout(resolve, 100));
+      // Small delay to prevent overwhelming the system
+      if (i + CONCURRENCY_LIMIT < totalParticipants) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      
+      console.log(`✅ Processed batch ${Math.floor(i/CONCURRENCY_LIMIT) + 1}/${Math.ceil(totalParticipants/CONCURRENCY_LIMIT)}`);
     }
+    
+    // Sort by index to maintain order
+    pdfBuffers.sort((a, b) => a.index - b.index);
 
     // 6. Create ZIP with progress updates
     jobEvents.emit('progress', {
@@ -495,8 +543,8 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       percent: 90,
       message: 'Creating ZIP archive...',
       stage: 'archiving',
-      processed: participants.length,
-      total: participants.length,
+      processed: totalParticipants,
+      total: totalParticipants,
       timestamp: new Date().toISOString()
     });
 
@@ -520,7 +568,7 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       archive.finalize();
     });
 
-    // 7. Store ZIP temporarily (or upload to storage)
+    // 7. Store ZIP temporarily
     const zipFileName = `zips/${jobId}.zip`;
     await supabase.storage
       .from('certificates')
@@ -548,15 +596,15 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
       jobId,
       type: 'completed',
       percent: 100,
-      message: `Generated ${participants.length} certificates successfully!`,
+      message: `Generated ${totalParticipants} certificates successfully!`,
       stage: 'completed',
-      processed: participants.length,
-      total: participants.length,
+      processed: totalParticipants,
+      total: totalParticipants,
       downloadUrl: urlData.publicUrl,
       timestamp: new Date().toISOString()
     });
 
-    console.log(`✅ Generated ${participants.length} certificates for job ${jobId}`);
+    console.log(`✅ Generated ${totalParticipants} certificates for job ${jobId} using concurrent processing`);
 
   } catch (err) {
     console.error('Generation error:', err);
@@ -585,6 +633,180 @@ async function processGenerationInBackground(jobId, userId, csvStoragePath, temp
   }
 }
 
+// ------------------------
+// Alternative: Enhanced /generate-direct with concurrent processing
+// ------------------------
+app.post('/generate-direct-concurrent', upload.fields([
+  { name: 'template', maxCount: 1 },
+  { name: 'csv', maxCount: 1 }
+]), async (req, res) => {
+  const { userId, fields, concurrency = 5 } = req.body;
+  const templateFile = req.files?.template?.[0];
+  const csvFile = req.files?.csv?.[0];
+  
+  if (!userId || !csvFile || !templateFile) {
+    return res.status(400).json({ 
+      error: 'Missing required files. Need both template and CSV files.' 
+    });
+  }
+
+  try {
+    // Parse CSV
+    const csvContent = csvFile.buffer.toString('utf8');
+    const lines = csvContent.split(/\r?\n/).filter(l => l.trim());
+    
+    if (lines.length < 2) {
+      return res.status(400).json({ error: 'CSV must contain at least one data row' });
+    }
+    
+    const headers = lines[0].split(',').map(h => h.trim());
+    const participants = lines.slice(1).map(line => {
+      const values = line.split(',').map(v => v.trim());
+      const obj = {};
+      headers.forEach((h, i) => obj[h] = values[i] || '');
+      return obj;
+    });
+
+    // Create job record
+    const jobId = crypto.randomUUID();
+    await supabase
+      .from('jobs')
+      .insert([{
+        id: jobId,
+        user_id: userId,
+        status: 'processing',
+        certificate_count: participants.length,
+        created_at: new Date().toISOString()
+      }]);
+
+    // Load font
+    const fontUrl = 'https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Mu4mxK.woff2';
+    let fontBytes;
+    try {
+      fontBytes = Buffer.from(await (await fetch(fontUrl)).arrayBuffer());
+    } catch (fontErr) {
+      console.warn('Using default font:', fontErr.message);
+      fontBytes = null;
+    }
+
+    // Set response headers
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="certificates_${Date.now()}.zip"`);
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('X-Job-ID', jobId);
+
+    // Create ZIP archive
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    archive.pipe(res);
+
+    // Store certificate buffers
+    const certificateBuffers = [];
+    const CONCURRENCY = parseInt(concurrency) || 5;
+    
+    // Process in concurrent batches
+    for (let i = 0; i < participants.length; i += CONCURRENCY) {
+      const batch = participants.slice(i, i + CONCURRENCY);
+      
+      const batchPromises = batch.map(async (participant, batchIndex) => {
+        const globalIndex = i + batchIndex;
+        
+        const pdfDoc = await PDFDocument.create();
+        
+        if (fontBytes) {
+          pdfDoc.registerFontkit(fontkit);
+          await pdfDoc.embedFont(fontBytes);
+        }
+        
+        const page = pdfDoc.addPage([600, 400]);
+
+        // Add template image
+        try {
+          let templateImage;
+          if (templateFile.mimetype === 'image/png') {
+            templateImage = await pdfDoc.embedPng(templateFile.buffer);
+          } else {
+            templateImage = await pdfDoc.embedJpg(templateFile.buffer);
+          }
+          page.drawImage(templateImage, { x: 0, y: 0, width: 600, height: 400 });
+        } catch (imgErr) {
+          console.warn('Failed to embed image:', imgErr.message);
+        }
+
+        // Add text fields
+        if (fields && Array.isArray(fields)) {
+          fields.forEach(f => {
+            const value = participant[f.field] || '';
+            if (value && f.x !== undefined && f.y !== undefined) {
+              try {
+                const hex = (f.color || '#000000').replace('#', '');
+                const r = parseInt(hex.slice(0, 2), 16) / 255;
+                const g = parseInt(hex.slice(2, 4), 16) / 255;
+                const b = parseInt(hex.slice(4, 6), 16) / 255;
+                
+                page.drawText(value.toString(), {
+                  x: f.x,
+                  y: 400 - f.y - (f.size || 16),
+                  size: f.size || 16,
+                  font: fontBytes ? undefined : pdfDoc.getFonts()[0],
+                  color: rgb(r, g, b)
+                });
+              } catch (fieldErr) {
+                console.warn(`Error drawing field ${f.field}:`, fieldErr.message);
+              }
+            }
+          });
+        }
+
+        const pdfBytes = await pdfDoc.save();
+        const participantName = participant.name || participant[headers[0]] || `certificate_${globalIndex + 1}`;
+        const safeFileName = `${participantName.replace(/[^a-zA-Z0-9]/g, '_')}.pdf`;
+        
+        return {
+          buffer: Buffer.from(pdfBytes),
+          name: safeFileName,
+          index: globalIndex
+        };
+      });
+
+      // Process batch concurrently
+      const batchResults = await Promise.all(batchPromises);
+      certificateBuffers.push(...batchResults);
+      
+      // Log progress
+      console.log(`Processed batch ${Math.floor(i/CONCURRENCY) + 1}/${Math.ceil(participants.length/CONCURRENCY)}`);
+    }
+
+    // Sort by index and add to archive
+    certificateBuffers
+      .sort((a, b) => a.index - b.index)
+      .forEach(cert => {
+        archive.append(cert.buffer, { name: cert.name });
+      });
+
+    await archive.finalize();
+    
+    // Update job status
+    await supabase
+      .from('jobs')
+      .update({
+        status: 'completed',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', jobId);
+
+    console.log(`✅ Generated ${participants.length} certificates concurrently for user ${userId}`);
+
+  } catch (err) {
+    console.error('Direct generation error:', err);
+    
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        error: 'Generation failed',
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
+    }
+  }
+});
 // ------------------------
 // Alternative: Generate from direct file uploads (no storage)
 // ------------------------
