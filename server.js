@@ -1074,6 +1074,24 @@ app.delete('/jobs/:jobId', async (req, res) => {
   }
 });
 
+// Sync Supabase user with your backend
+const syncUserWithBackend = async (supabaseUser) => {
+  try {
+    const response = await axios.post(`${API_BASE_URL}/sync-user`, {
+      supabaseId: supabaseUser.id,
+      email: supabaseUser.email,
+    });
+    
+    if (response.data.success) {
+      // Return the backend user ID
+      return response.data.user;
+    }
+  } catch (error) {
+    console.error('Failed to sync user with backend:', error);
+  }
+  return null;
+};
+
 // ------------------------
 // Get user's stored templates
 // ------------------------
@@ -1119,6 +1137,116 @@ app.get('/health', async (req, res) => {
       supabase: 'disconnected',
       error: err.message
     });
+  }
+});
+
+// ------------------------
+// Sync Google/Supabase user with backend
+// ------------------------
+app.post('/sync-user', async (req, res) => {
+  const { supabaseId, email, name } = req.body;
+  
+  if (!email || !supabaseId) {
+    return res.status(400).json({ error: 'Email and supabaseId are required' });
+  }
+
+  try {
+    // Check if user already exists by email
+    const { data: existingUser, error: fetchError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email)
+      .single();
+
+    let backendUserId;
+    
+    if (existingUser) {
+      // User exists - use existing ID
+      backendUserId = existingUser.id;
+      
+      // Update with supabaseId if not already set
+      if (!existingUser.supabase_id) {
+        await supabase
+          .from('users')
+          .update({ supabase_id: supabaseId })
+          .eq('id', existingUser.id);
+      }
+    } else {
+      // Create new user for Google login
+      backendUserId = crypto.randomUUID();
+      
+      const { data: newUser, error: createError } = await supabase
+        .from('users')
+        .insert([{
+          id: backendUserId,
+          email: email,
+          supabase_id: supabaseId,
+          password_hash: null, // No password for Google users
+          name: name || email.split('@')[0],
+          is_google_user: true,
+          created_at: new Date().toISOString()
+        }])
+        .select()
+        .single();
+
+      if (createError) {
+        console.error('Error creating user:', createError);
+        return res.status(500).json({ error: 'Failed to create user' });
+      }
+    }
+
+    res.json({ 
+      success: true, 
+      user: { 
+        id: backendUserId,
+        email: email,
+        name: name || email.split('@')[0]
+      } 
+    });
+
+  } catch (err) {
+    console.error('Sync user error:', err);
+    res.status(500).json({ error: 'Failed to sync user: ' + err.message });
+  }
+});
+
+
+app.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+  
+  try {
+    // First, try to find user by email
+    const { data: userData, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email)
+      .single();
+
+    if (error || !userData) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Check if this is a Google user (no password)
+    if (userData.password_hash === null && userData.is_google_user) {
+      return res.status(400).json({ 
+        error: 'This account uses Google login. Please sign in with Google.' 
+      });
+    }
+
+    const match = await bcrypt.compare(password, userData.password_hash);
+    if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+
+    res.json({ 
+      success: true, 
+      user: { 
+        id: userData.id,
+        email: userData.email,
+        name: userData.name
+      } 
+    });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Login failed: ' + err.message });
   }
 });
 
