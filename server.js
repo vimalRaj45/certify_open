@@ -1140,6 +1140,127 @@ app.get('/health', async (req, res) => {
   }
 });
 
+
+// ------------------------
+// Generate Single PDF Preview
+// ------------------------
+app.post('/preview', async (req, res) => {
+  const { templateUrl, fields, sampleData } = req.body;
+  
+  if (!templateUrl || !fields || !sampleData) {
+    return res.status(400).json({ 
+      error: 'Missing required parameters: templateUrl, fields, sampleData' 
+    });
+  }
+
+  try {
+    console.log('Generating preview with template:', templateUrl);
+    
+    // 1. Download template
+    const templateBuffer = await getBufferFromUrl(templateUrl);
+    
+    // 2. Load font
+    const fontUrl = 'https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Mu4mxK.woff2';
+    let fontBytes;
+    try {
+      fontBytes = Buffer.from(await (await fetch(fontUrl)).arrayBuffer());
+    } catch (fontErr) {
+      console.warn('Using default font for preview:', fontErr.message);
+      fontBytes = null;
+    }
+
+    // 3. Create PDF document
+    const pdfDoc = await PDFDocument.create();
+    
+    if (fontBytes) {
+      pdfDoc.registerFontkit(fontkit);
+      await pdfDoc.embedFont(fontBytes);
+    }
+    
+    // 4. Add page (standard certificate size)
+    const page = pdfDoc.addPage([600, 400]);
+
+    // 5. Add template image
+    let img;
+    if (templateUrl.toLowerCase().endsWith('.png')) {
+      img = await pdfDoc.embedPng(templateBuffer);
+    } else {
+      // Default to JPG
+      img = await pdfDoc.embedJpg(templateBuffer);
+    }
+    
+    page.drawImage(img, { 
+      x: 0, 
+      y: 0, 
+      width: 600, 
+      height: 400 
+    });
+
+    // 6. Add text fields with sample data
+    if (fields && Array.isArray(fields)) {
+      fields.forEach(f => {
+        const value = sampleData[f.field] || `[${f.field}]`;
+        if (value && f.x !== undefined && f.y !== undefined) {
+          try {
+            // Convert hex color to RGB
+            let r = 0, g = 0, b = 0;
+            if (f.color && f.color.startsWith('#')) {
+              const hex = f.color.replace('#', '');
+              r = parseInt(hex.slice(0, 2), 16) / 255;
+              g = parseInt(hex.slice(2, 4), 16) / 255;
+              b = parseInt(hex.slice(4, 6), 16) / 255;
+            }
+            
+            page.drawText(value.toString(), {
+              x: f.x,
+              y: 400 - f.y - (f.size || 16), // Invert Y for PDF coordinate system
+              size: f.size || 16,
+              font: fontBytes ? undefined : pdfDoc.getFonts()[0],
+              color: rgb(r, g, b)
+            });
+          } catch (fieldErr) {
+            console.warn(`Error drawing preview field ${f.field}:`, fieldErr.message);
+          }
+        }
+      });
+    }
+
+    // 7. Add preview watermark (optional)
+    page.drawText('PREVIEW', {
+      x: 300,
+      y: 380,
+      size: 12,
+      color: rgb(1, 0, 0),
+      opacity: 0.3
+    });
+
+    // 8. Save PDF
+    const pdfBytes = await pdfDoc.save();
+    
+    // Convert to base64 for easy frontend display
+    const base64 = Buffer.from(pdfBytes).toString('base64');
+    const dataUrl = `data:application/pdf;base64,${base64}`;
+    
+    console.log('Preview generated successfully');
+    
+    res.json({
+      success: true,
+      previewUrl: dataUrl,
+      previewPdf: base64,
+      message: 'Preview generated successfully',
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (err) {
+    console.error('Preview generation error:', err);
+    res.status(500).json({ 
+      success: false,
+      error: err.message,
+      details: process.env.NODE_ENV === 'development' ? err.stack : undefined
+    });
+  }
+});
+
 // ------------------------
 // Sync Google/Supabase user with backend
 // ------------------------
